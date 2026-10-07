@@ -3,7 +3,7 @@
   "scope": "Offline report validation, not new inference or production acceptance",
   "data_validation": {
     "status": "PASS",
-    "unit_tests": 15,
+    "unit_tests": 18,
     "historical_measurement_rows_checked_against_originals": 395,
     "source_files_size_and_sha256_verified": 2217,
     "checks": [
@@ -17,17 +17,20 @@
       "JSON and measurement CSV byte-identical to the previous publication",
       "English research narrative with separate measurement explorer and technical appendix",
       "Original Square Rabbits logo embedded byte-identically for offline use",
+      "Three Q3/upstream recipes linked to their exact measured configurations",
+      "All captured launch argv preserved by shell-quoted formatting",
+      "Build commands, audio JSON and component/protocol reference checked against saved sources",
       "Privacy-marker scan; selected-field export excludes raw conversations and audio"
     ]
   },
   "browser_validation": {
     "status": "PASS",
-    "checks": 25,
+    "checks": 45,
     "desktop_width_px": 1440,
     "mobile_width_px": 390,
     "runtime_errors": 0,
     "external_runtime_requests": 0,
-    "features": ["English report as the default view", "Separate data explorer and technical appendix", "Curated figures linked to exact source records", "Filters", "Configuration details", "Sorting", "Pagination", "Filtered CSV download", "Responsive report, explorer and appendix without horizontal page overflow"]
+    "features": ["Q3/upstream practical guide as the default view", "Three tested recipes with complete startup commands", "Build and component/protocol reference", "Searchable 96-configuration catalogue with linked measurements", "Strata as a separate collapsed experiment", "Separate data explorer and technical appendix", "Curated figures linked to exact source records", "Filters", "Configuration details", "Sorting", "Pagination", "Filtered CSV download", "Responsive report, recipes, explorer and appendix without horizontal page overflow"]
   },
   "limits": "Publication checks do not turn capped speed tests, failed quality tests or unaccepted microphone tests into PASS. Original private payloads are not redistributed."
 }

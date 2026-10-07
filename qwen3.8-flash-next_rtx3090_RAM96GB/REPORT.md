@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next on a single RTX 3090
 
-## Long-context inference with 24 GiB VRAM and 96 GB system memory
+## A practical configuration guide for 24 GiB VRAM and 96 GB system memory
 
 Square Rabbits · Experimental results, 4–7 October 2026 · Published 7 October 2026
 
@@ -10,13 +10,52 @@ Square Rabbits · Experimental results, 4–7 October 2026 · Published 7 Octobe
 
 This study examines the throughput, memory use and practical integration of Qwen3.8-Flash-Next on an EVGA GeForce RTX 3090 OC FTW3 Ultra, an AMD Ryzen 9 8945HX and nominal 96 GB of system memory. The experiments cover Unsloth UD-Q4_K_XL and UD-IQ3_XXS weights, five inference implementations, and inputs approaching a 262,144-token context allocation. The performance criterion is prompt processing above 1,000 tokens/s and generation at or above 30 tokens/s; 40 tokens/s is a secondary target.
 
-At 260,000 fresh input tokens, Q4 running in Strata achieved median **1,230.04 prompt tokens/s** and **30.40 generated tokens/s** over three capped 512-token reasoning runs. Sampled process VRAM peaked at **11.883 GiB**, while the active cgroup reported **74.060 GiB** peak memory. One run generated at 29.29 tokens/s. Reducing the cgroup limit from 80 to 48 GiB and the resident expert budget from 62 to 24 GiB reduced throughput to **773.13/9.30 tokens/s** in one completed run.
+The practical baseline is **Unsloth UD-IQ3_XXS in upstream llama.cpp**, the implementation retained for integrated serving. A 32k configuration measured **1,253.31 prompt tokens/s and 31.42 generated tokens/s** at 28,672 fresh input tokens. A 256k throughput-oriented configuration measured **905.76/27.39 tokens/s** at 235,929 tokens; both had separate passing natural-retrieval requests. The integrated 256k profile trades GPU placement and microbatch size for speech headroom. Its 230,100-token API test recorded **1,067.78/26.56 tokens/s**, a functional observation rather than an isolated quality benchmark.
 
-For Q3 in upstream llama.cpp, a 235,929-token throughput request measured **905.76/27.39 tokens/s**, and a separate natural-retrieval request passed its exact-value checks. At 8,192 tokens, the thecodacus implementation reached **1,197.90/35.97 tokens/s**, as the median of five runs. Increasing actual input length reduced throughput in the measured long-context configurations. A matched upstream comparison found substantially faster long-context generation with f16 KV than q8_0 KV.
+The most useful tuning findings concern hybrid expert placement, sufficiently large microbatches, physical-core thread placement and KV format. In a matched long-input comparison, **f16 KV increased decode by 59.72% over q8_0** while prefill was nearly unchanged. More expert cache alone did not resolve poor prefill; speculative decoding helped generation in some forks but reduced prefill in another.
 
-The Strata observations establish near-full-context throughput, not completed-task quality: all three requests exhausted the output budget during reasoning. Comparisons between Strata and llama.cpp also change quantization, KV handling, speculative decoding and protocol. This report separates within-configuration observations from cross-system comparisons and distinguishes throughput, retrieval, API transport and voice measurements.
+An additional Strata Q4 experiment reached median **1,230.04/30.40 tokens/s** at 260,000 fresh tokens with 11.883 GiB sampled process VRAM and 74.060 GiB peak cgroup memory. It remained an experiment, not the serving recommendation: all three runs ended during capped reasoning, and integrated tools, vision and speech were not validated for it. This report provides concrete Q3 configuration choices first, then the measurements and limitations supporting them.
 
-## 1. Research questions and principal results
+## 1. Start here: choose a tested Q3 configuration
+
+For this hardware, use the pinned **upstream llama.cpp commit `8345f333951c661d166b00e6f9362e553768f292`** and **Unsloth UD-IQ3_XXS** as the straightforward integrated baseline. The following are tested starting points for different priorities, not one universal optimum. Commands below use this specific build's flags; they are not a promise of compatibility with an arbitrary release or fork.
+
+| Priority | Configuration | Context | CPU MoE | Threads | Batch / microbatch | KV | Observed PP / TG | Record |
+| --- | --- | ---: | ---: | ---: | --- | --- | --- | --- |
+| Interactive speed when 32k is sufficient | Upstream short-context | 32,768 | 43 | 14 / 14 | 8,192 / 8,192 | f16 / f16 | 1,253.31 / 31.42 at 28,672 input; n=1 + separate retrieval | `C057` |
+| Large-context text without the speech-headroom tradeoff | Upstream long-context | 262,144 | 46 | 14 / 14 | 8,192 / 4,096 | f16 / f16 | 905.76 / 27.39 at 235,929 input; n=1 + separate retrieval | `C053` |
+| Integrated API, tools, vision and room for speech | **Profile used for serving** | 262,144 | 48 | 14 / 14 | 8,192 / 2,048 | f16 / f16 | 1,067.78 / 26.56 at 230,100 input; n=1 functional transport | `C096` |
+
+The three rows use the same Q3 weights and upstream implementation. They differ in offload placement, microbatch and allocation. The final row's timing used a different repetitive input and no concurrent audio; it cannot establish faster prefill than the second row. Speech compatibility and isolated text throughput are different objectives.
+
+### 1.1 A concise starting command
+
+The following performance settings describe the 32k configuration. Keep all three Q3 shards together and point the server to the first shard. Local paths, GPU selection and CPU topology must match the installation.
+
+```text
+llama-server \
+  --model Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+  --spec-type none --gpu-layers 99 --n-cpu-moe 43 \
+  --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 \
+  --load-mode none --lazy-mode on --fit off --flash-attn on \
+  --cache-type-k f16 --cache-type-v f16 \
+  --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt \
+  --batch-size 8192 --ubatch-size 8192 --jinja
+```
+
+To use the **tested long-context text variant**, change CPU MoE to **46**, context to **262,144**, and microbatch to **4,096**. For the **integrated serving variant**, use CPU MoE **48** and microbatch **2,048**, retain context 262,144, and apply its vendor chat template and CPU-side multimodal projector from §8.1. Exact complete startup commands, including sampling, environment, timeout and endpoint settings, are in Appendix C (`C057`, `C053`, `C096`); the HTML offers them directly beside the configuration selector.
+
+### 1.2 Seven useful tuning decisions
+
+1. **Prefer hybrid placement over assuming all-CPU MoE plus a large hot-expert cache is fastest.** The initial Q3 CPU99 control measured 183.07 PP; the hybrid CPU43/MTP2 f16 finalist measured 1,197.90 PP at the same 8,192-token length. Multiple settings changed, but the tested configuration family is a much stronger starting point.
+2. **Use the measured 14-thread placement as a baseline, not all 32 logical CPUs automatically.** The tuned configurations use 14 generation and 14 batch threads. Verify topology before copying `0xffff`; on this host it selects separate physical cores. Thread count is not the meaning of CPU MoE 43/46/48.
+3. **Match microbatch to context and GPU headroom.** The 32k upstream condition uses 8,192; the 256k text condition uses 4,096; the integrated condition uses 2,048. A large-slot u8192 trial failed a CUDA check. Do not transplant the short-context microbatch into a full-context service without checking peak memory.
+4. **Start with f16 KV for the tested upstream long-context workload.** The matched 235,929-token pair generated at 26.78 TG with f16 versus 16.77 with q8_0. Choose a smaller KV format for a demonstrated capacity need, not on the assumption that it will be faster.
+5. **Keep MTP implementation-specific.** Upstream serving uses no speculation. The historical thecodacus MTP2 finalist reached 35.97 TG at 8,192 tokens, but requires that fork and its draft component. ik MTP improved decode while hurting prefill. Do not mix those commands or advertise their short-context rates for 256k.
+6. **Use KV-prefix reuse for repeated history, but account for it correctly.** Cache reuse can avoid recomputing a shared prefix. A continuation's fresh-token rate is not a throughput measurement for the entire cached history. A completely new 230k–260k input still takes minutes to prefill in the measured conditions.
+7. **Reserve a separate budget for audio and validate a complete workload.** The serving configuration's increased CPU placement and smaller microbatch preserve space for Chatterbox. Its API timing was not collected with simultaneous TTS/ASR. Peak prefill memory, retrieval, tool completion and speech latency need separate checks; loading the weights alone is insufficient.
+
+### 1.3 Research questions and principal results
 
 The experiments address four questions:
 
@@ -69,6 +108,27 @@ Q3 and Q4 refer to these specific mixed-quantization variants, not a uniform bit
 
 Implementation references: [Unsloth weights](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), [thecodacus pinned README](https://github.com/thecodacus/llama.cpp/blob/27c54b4bbcefadedcec6397477cc2e866c1db716/README.md), [Strata](https://github.com/Niko1221/Strata), [llama-swap](https://github.com/mostlygeek/llama-swap). Throughput below comes from this campaign, not project documentation.
 
+### 2.2 Serving, agent and audio components
+
+The inference microbenchmarks call the selected engine directly. Application tests add the following components; their latency must not be assigned to engine throughput.
+
+| Component | Version / artifact | Relevant settings and role |
+| --- | --- | --- |
+| llama-swap | 262 | Backend process management; one llama.cpp slot; no durable shared image/LLM queue |
+| Nginx | System package | Response buffering off; HTTP/1.1 upstream; no proxy retry; 1,860-second read timeout |
+| LiteLLM | 1.104.0 | Chat Completions / Responses gateway; 15-second SSE keepalives in the long-input functional check |
+| Codex CLI | 0.160.1 | Native long-history, compaction and tool-continuation client |
+| Pithagoras | `a14763d7f6172d632ebe8577ee2cb581d8e1ae2e`; image `sha256:9c899f8675392e9b74005e09d27d9b4071efa1a5fbb18c7bba61e2a196e4ef07` | Unmodified application; parallel voice pipeline; first voice response skips thinking; status speech disabled |
+| pi-web-access | 0.35.0; `72c6e67787d67d8a7d01bf0abf30c072a6112de6` | Search and complete-document retrieval tools |
+| Headless Chromium | Observed 155.0.8059.26; pinned headless-shell image | `--disable-gpu`; CPU/software rendering; 2 CPUs, 2 GiB memory limit, 1 GiB shared memory |
+| audio.cpp | v0.9.0; `795c45fbde0a7d29c93b22199728ff5caaec02e5` | Separate CUDA TTS and CPU ASR servers |
+| Chatterbox | `chatterbox-q8_0.gguf`; audio weights revision `6d5436fc85f7a20c2e9f4e472b7f3a532f686444` | CUDA device 0, 4 threads; Polish speech; multilingual T3 v3; two conditioning-cache slots |
+| Qwen3-ASR | 0.6B Q8_0, same audio revision | CPU, 4 threads; lazy load; 90,000 ms idle unload |
+
+For the saved TTS configuration, `lazy_load=false`, `idle_unload_ms=0`, `min_free_memory_mb=2048`, and `max_loaded_models=1`. The ASR service has no CUDA-visible device. The first-response voice path and normal thinking-enabled text path are separate policies. The audio weight sizes are 2,088,393,668 and 1,151,272,416 bytes; SHA256 values, full JSON settings, build commands and server launch commands are in Appendix E and [components-and-protocols.json](data/components-and-protocols.json). These audio JSON files are the saved deployment settings, not request-time dumps for every phrase.
+
+The gateway container has a 2-CPU/3-GiB limit; Chromium has its separate 2-CPU/2-GiB limit. Neither is a limit on the native llama.cpp process. LiteLLM and its router have zero configured retries and 1,860-second request budgets. Nginx disables response buffering and upstream retries, with a 1,860-second read timeout and 60-second send timeouts. These settings affect streaming continuity and completion latency, not the engine's reported prompt/decode rates. Appendix E includes the pinned gateway image, container arguments, service commands and selected proxy directives; credentials are not part of the reproduction parameters.
+
 ## 3. Methods
 
 ### 3.1 Experimental units
@@ -104,6 +164,14 @@ Throughput requests often use a 512-token cap. Retrieval requests instead requir
 Medians combine only identical series, case, protocol, actual input and cache state. Screening uses three repetitions and selected finalists five; several long-context results have one. This staged study is not a randomized factorial experiment. A full 16k–256k matrix with all fill levels was not completed for one invariant configuration. Temperature, file cache and test order can influence observations.
 
 In configuration labels, “CPU MoE N” or “CPUN” denotes the `--n-cpu-moe` setting, not the CPU thread count. The shorthand `t`, `b` and `u` denotes threads, batch size and microbatch size, respectively. Full arguments are provided in Appendix C.
+
+### 3.4 Request parameters that affect the result
+
+For upstream `C053`/`C057`, streamed native `/completion` requests provide an exact token array containing the complete native chat template. Throughput uses `n_predict=512`, `ignore_eos=true`, `cache_prompt=false`, temperature 1.0, top-p 0.95, top-k 20, min-p 0, presence penalty 0, repeat penalty 1.0 and seed 174. Thinking remains natively enabled. Natural-retrieval requests omit `ignore_eos`, allow up to `min(4096, context - input - 32)` output tokens and require a natural stop.
+
+The historical thecodacus harness uses seed `174 + repetition index`. Its fresh and reuse-requested samples are separate; prefix reuse is accepted only when native counters confirm it. Retrieval in that harness permits up to `min(16384, context - input - 32)` output tokens. Strata instead uses temperature zero, thinking HIGH and a 512-token cap; this contributes to the lack of engine-only comparability.
+
+The integrated Responses check uses `max_output_tokens=2048`, reasoning effort `xhigh`, a repetitive synthetic history and a 1,860-second client timeout. It generates 80 tokens in the reported request rather than the fixed 512-token speed-test workload. Source-defined request settings are included in Appendix E. OS page cache was not routinely cleared, and manual power/clock/thermal controls were not consistent across the staged campaign.
 
 ## 4. Offload and expert caching
 
@@ -272,6 +340,8 @@ These are single functional observations with repetitive synthetic history, not 
 
 Twenty synthetic Chatterbox TTS → Qwen ASR cycles yielded full-WAV latency **0.829 s p50 / 2.410 s p95**. The first cold trial took **42.304 s** while overlapping LLM work; minimum free VRAM was 4,317 MiB. A separate warm joint first-response test without thinking for speech measured **5.877 s TTS / 1.872 s ASR**, with minimum free VRAM 5,243 MiB. A portal turn took 14.753 s; reply TTS took 0.922 s.
 
+The measurement script uses the upper middle sample for p50 (`sorted[n//2]`) and nearest rank for p95 (`sorted[ceil(0.95*n)-1]`). It caps the concurrent LLM response at 1,024 tokens, samples resources every 0.5 s, and gives TTS and ASR clients 130-second budgets. It records whether LLM decoding is active when each synthesis begins: this is not a claim that all 20 phrases overlap LLM generation. The later first-response variant explicitly disables thinking; the earlier default path leaves it enabled.
+
 These are server-stage/complete-WAV times, not end-of-human-speech to first-audible-response latency. Two early voice series completed no phrases. Later cycles produced audio but failed strict transcription: a 4.48 s WAV took 2.661 s TTS plus 1.982 s ASR, with one word wrong. The synthetic loop cannot isolate synthesis from recognition errors; live microphone, listening and interruption quality are outside its scope.
 
 The Pithagoras audit exercised **20 of 32 enabled tools**: files, edits, bash, terminal, canvas, Chromium, three searches, two page reads, file output, continuation, cross-session memory, a 32k subagent and images. An 18-call research task took 413.906 s, without establishing completion of the separate 100-restaurant benchmark. One subagent reasoned in English; a separate bash check returned exit 1. Understory write/read completed in 87.787/66.888 s after increasing the documented timeout beyond 60 s. A 35 s HTTP/1.1 test addressed partial HTTP/2 SSE behavior in Firefox, not live microphone quality.
@@ -286,11 +356,11 @@ Recorded failures include CUDA assertions at large microbatches, occupied ports,
 
 ## 10. Conclusions
 
-1. **Near-full-context throughput is feasible on this platform.** Strata Q4 reached median 1,230.04 PP / 30.40 TG at 260,000 fresh tokens with 11.883 GiB sampled process VRAM. One repetition fell below 30 TG; all outputs were capped in reasoning.
-2. **Host residency is a central constraint.** Jointly reducing the memory limit and expert budget caused a much larger relative loss in decode than prefill. This is not an isolated RAM-capacity law.
-3. **KV format needs workload-specific measurement.** Matched upstream f16 KV increased deep-context decode 59.72% over q8_0 despite its less compact format.
-4. **Actual occupancy affects speed.** Upstream CPU46/u4096 lost 15.10% prefill and 10.03% decode between 8,192 and 235,929 input tokens. A 256k allocation does not preserve short-input speed automatically.
-5. **Throughput and useful agent behavior require different evidence.** Q3 retrieval was validated separately. Strata's capped speed runs do not establish retrieval, tool or speech quality.
+1. **Q3/upstream is the practical integrated baseline.** Use the 32k CPU43/u8192 condition when that capacity is sufficient, CPU46/u4096 for long-context text, or the retained CPU48/u2048 profile when reserving audio headroom. Each serves a different priority; the complete commands are supplied.
+2. **KV format needs workload-specific measurement.** Matched upstream f16 KV increased deep-context decode 59.72% over q8_0 despite its less compact format. Hybrid placement and microbatch selection matter more than simply increasing expert-cache size in the initial tested path.
+3. **Actual occupancy affects speed.** Upstream CPU46/u4096 lost 15.10% prefill and 10.03% decode between 8,192 and 235,929 input tokens. A 256k allocation does not preserve short-input speed automatically; reuse helps only when the prefix is actually shared.
+4. **Strata demonstrates an alternative throughput envelope, not the serving configuration.** Q4 reached median 1,230.04 PP / 30.40 TG at 260,000 fresh tokens with 11.883 GiB sampled process VRAM. One repetition fell below 30 TG and every output was capped during reasoning. Jointly reducing host memory limit and resident budget strongly reduced decode.
+5. **Throughput and useful agent behavior require different evidence.** Q3 retrieval and tool continuation were validated separately. Strata's capped speed runs do not establish those properties, and synthetic audio timing does not establish live voice latency.
 6. **No configuration demonstrated every target simultaneously.** Sustained 40 TG near full context, a guaranteed joint threshold across repeats, broad natural-task quality at 260k and live-speech interruption latency are not established by this dataset.
 
 Explicit residency management extends the long-context performance envelope. End-to-end utility additionally depends on completed answers, retrieval accuracy, tool integration and audio headroom. The integrated Q3 profile and experimental Strata Q4 configuration serve different demonstrated purposes; the campaign is not a controlled ranking of engines.
@@ -609,8 +679,59 @@ Commands are specific to the pinned implementation. Substitute local paths for `
 
 Source: `context176-262144-cpu48-q8-20261005/ctx262144-cpu48-q8_0-b8192/configuration.json`, SHA256 `2d7c52b17b7a4b0a5182ea8b4189b12d74e36636a0e9f4a319195fa1fc300251`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 48 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -627,8 +748,59 @@ Source: `context176-262144-cpu48-q8-20261005/ctx262144-cpu48-q8_0-b8192/configur
 
 Source: `context176-262144-cpu48-q8-u1024-20261005/ctx262144-cpu48-q8_0-b8192-u1024/configuration.json`, SHA256 `e2cb8a7ff9f14b47988a588a4b56e9f69541b1fec30f6ef8bc37a24265b03139`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 48 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 1024 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 1024 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -645,8 +817,59 @@ Source: `context176-262144-cpu48-q8-u1024-20261005/ctx262144-cpu48-q8_0-b8192-u1
 
 Source: `context176-262144-cpu48-q8-u2048-20261005/ctx262144-cpu48-q8_0-b8192-u2048/configuration.json`, SHA256 `eb0739664396eaa29e7e1196ccfe94a8e203ab42d109add7f99a0280d6c4b4f6`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 48 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 2048 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 2048 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -663,8 +886,59 @@ Source: `context176-262144-cpu48-q8-u2048-20261005/ctx262144-cpu48-q8_0-b8192-u2
 
 Source: `context176-32768-cpu43-q8-20261005/ctx32768-cpu43-q8_0-b8192/configuration.json`, SHA256 `bfbc368e38b5ef2bb4a85a4d66565236e05d7dedcfc41fce73c27f1a03e0d771`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 43 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -681,8 +955,59 @@ Source: `context176-32768-cpu43-q8-20261005/ctx32768-cpu43-q8_0-b8192/configurat
 
 Source: `context176-32768-cpu48-q8-control-20261005/ctx32768-cpu48-q8_0-b8192/configuration.json`, SHA256 `5c7c5471de304f68ca306df546ec5590a1ed9ef63bd3e493a50d35ab8219d045`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 48 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -699,8 +1024,59 @@ Source: `context176-32768-cpu48-q8-control-20261005/ctx32768-cpu48-q8_0-b8192/co
 
 Source: `context176-32768-cpu48-q8-u1024-control-20261005/ctx32768-cpu48-q8_0-b8192-u1024/configuration.json`, SHA256 `43566c28a2aad347a8e5366fe4772e14c128dbff6ee99de7a6eff188162e357c`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 48 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 1024 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 1024 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -717,8 +1093,59 @@ Source: `context176-32768-cpu48-q8-u1024-control-20261005/ctx32768-cpu48-q8_0-b8
 
 Source: `context176-32768-cpu48-q8-u2048-control-20261005/ctx32768-cpu48-q8_0-b8192-u2048/configuration.json`, SHA256 `480938ce5744ef74cc07f20bae6df84fa65c0a178e94f25ae882b4ee12f7c611`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 48 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 2048 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 2048 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -735,8 +1162,59 @@ Source: `context176-32768-cpu48-q8-u2048-control-20261005/ctx32768-cpu48-q8_0-b8
 
 Source: `context176-40960-cpu44-f16-u8192-screen-20261005/ctx40960-cpu44-f16-b8192-u8192/configuration.json`, SHA256 `491e906764b52c775796c720a618cbe18d53c4b0c9522f7732eee01d1a956a24`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 44 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 40960 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 44 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 40960 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -753,8 +1231,59 @@ Source: `context176-40960-cpu44-f16-u8192-screen-20261005/ctx40960-cpu44-f16-b81
 
 Source: `context176-45056-cpu45-f16-u8192-screen-20261005/ctx45056-cpu45-f16-b8192-u8192/configuration.json`, SHA256 `1b5c0f89909e03f461d8901faa280f36c78c6c5d5bae7d880e652ea3a99259a3`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 45 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 45056 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 45 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 45056 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -771,8 +1300,59 @@ Source: `context176-45056-cpu45-f16-u8192-screen-20261005/ctx45056-cpu45-f16-b81
 
 Source: `context176-47104-cpu45-f16-u8192-screen-20261005/ctx47104-cpu45-f16-b8192-u8192/configuration.json`, SHA256 `9b8f25602bf689fd026f00bffb2ce94dd0e09c61987c42833db4af0b7ff02e68`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 45 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 47104 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 45 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 47104 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -789,8 +1369,59 @@ Source: `context176-47104-cpu45-f16-u8192-screen-20261005/ctx47104-cpu45-f16-b81
 
 Source: `context176-49152-cpu46-f16-u8192-screen-20261005/ctx49152-cpu46-f16-b8192-u8192/configuration.json`, SHA256 `ffee4c421befbc2f9bb01336a5a00e386a02ef6cba5be48f523ab29641bab8bc`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 46 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 49152 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 46 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 49152 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -807,8 +1438,59 @@ Source: `context176-49152-cpu46-f16-u8192-screen-20261005/ctx49152-cpu46-f16-b81
 
 Source: `context176-65536-cpu48-f16-u8192-screen-20261005/ctx65536-cpu48-f16-b8192-u8192/configuration.json`, SHA256 `0c02056115b63d74a5cbb37a2f75254dda81f84e2d59424a8c8e002a6bed2def`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14027 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 48 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 65536 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14027 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 65536 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1 \
+  --offline
 ```
 
 ```json
@@ -825,8 +1507,47 @@ Source: `context176-65536-cpu48-f16-u8192-screen-20261005/ctx65536-cpu48-f16-b81
 
 Source: `guided-speed175-20261005/baseline96/configuration.json`, SHA256 `f5f2a2fdad1dfa2182df479de95d4d672536266e6b3577edace51c083646f840`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 96 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 4096 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 96 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -843,8 +1564,47 @@ Source: `guided-speed175-20261005/baseline96/configuration.json`, SHA256 `f5f2a2
 
 Source: `guided-speed175-20261005/batch8192-cache96/configuration.json`, SHA256 `087814832b2ab620091c561a4a98892c9bb19f07e6ad8c34d8a0167e031f4cd4`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 96 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 96 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -861,8 +1621,58 @@ Source: `guided-speed175-20261005/batch8192-cache96/configuration.json`, SHA256 
 
 Source: `guided-speed175-20261005/gpu-mtp2-cache96/configuration.json`, SHA256 `a485cd73d5fda457a43f623ec7551a264d41533b6c75a30ea5094713144b20d4`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 96 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 99 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 4096 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 96 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -879,8 +1689,46 @@ Source: `guided-speed175-20261005/gpu-mtp2-cache96/configuration.json`, SHA256 `
 
 Source: `guided-speed175-20261005/overlap-cache112/configuration.json`, SHA256 `741ea1c27bf242763b06503282eaf126c7d27035a18d3c65e991f6145ab75b84`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 112 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 4096 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 112 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -897,8 +1745,47 @@ Source: `guided-speed175-20261005/overlap-cache112/configuration.json`, SHA256 `
 
 Source: `guided-speed175-finalist-20261005/batch8192-cache80/configuration.json`, SHA256 `fb9c4186871f22d7bce37aad37f53dcfa9fbf0c4bda8f66d124bee4c38e959db`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -915,8 +1802,47 @@ Source: `guided-speed175-finalist-20261005/batch8192-cache80/configuration.json`
 
 Source: `guided-speed175-followup-20261005/batch8192-cache80/configuration.json`, SHA256 `6b8f16237300e7125def1b702d0931a9956af3fde08bcb92f027eb4c27765a71`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -933,8 +1859,58 @@ Source: `guided-speed175-followup-20261005/batch8192-cache80/configuration.json`
 
 Source: `guided-speed175-followup-20261005/gpu-mtp2-cache64/configuration.json`, SHA256 `f737871efe0e520a93facd3131f74a9e684b9f0a970904afb9ec7b8bf343a661`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 64 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 99 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 4096 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 64 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -951,8 +1927,58 @@ Source: `guided-speed175-followup-20261005/gpu-mtp2-cache64/configuration.json`,
 
 Source: `guided-speed175-followup-20261005/hybrid-mtp2-b8192-cache72/configuration.json`, SHA256 `59e4fe17c871bf55f6b827a75c62acbb3e7b68e5c06bc39d8c82d88822679adc`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 72 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 99 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 0 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 72 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 0 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -969,8 +1995,47 @@ Source: `guided-speed175-followup-20261005/hybrid-mtp2-b8192-cache72/configurati
 
 Source: `guided-speed175-native-profile-20261005/batch16384-cache16-t16/configuration.json`, SHA256 `1db4a961601d87d10a75d3b22ff824e977d6c7ba9224914d67bb18e2f174fb5d`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 16 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 16 --threads-batch 16 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 16384 --ubatch-size 16384 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 16 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 16 \
+  --threads-batch 16 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 16384 \
+  --ubatch-size 16384 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -987,8 +2052,47 @@ Source: `guided-speed175-native-profile-20261005/batch16384-cache16-t16/configur
 
 Source: `guided-speed175-native-profile-20261005/batch8192-cache80/configuration.json`, SHA256 `fb9c4186871f22d7bce37aad37f53dcfa9fbf0c4bda8f66d124bee4c38e959db`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1005,8 +2109,47 @@ Source: `guided-speed175-native-profile-20261005/batch8192-cache80/configuration
 
 Source: `guided-speed175-native-profile-20261005/batch8192-cache80-t16/configuration.json`, SHA256 `6e1cdb8f05539023e9ae6f1adf3918a4f9dc7dca5470ad551fa13ac88b716853`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 16 --threads-batch 16 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 16 \
+  --threads-batch 16 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1023,8 +2166,45 @@ Source: `guided-speed175-native-profile-20261005/batch8192-cache80-t16/configura
 
 Source: `historical180/mtp-screen32-20261005/control/configuration.json`, SHA256 `b15bb1ecb94ff5b10bd8fad553f478c17de1775ef37f7ef94af1cff4c04fb150`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14024 --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 99 --fit off --spec-type none --load-mode mmap --lazy-mode on --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --threads 14 --threads-batch 14 --batch-size 4096 --ubatch-size 4096 --no-sched-async-cpu --cpu-mask 0xffff --cpu-strict 1 --cache-prompt --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 64 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14024 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --fit off \
+  --spec-type none \
+  --load-mode mmap \
+  --lazy-mode on \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --threads 14 \
+  --threads-batch 14 \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
+  --no-sched-async-cpu \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --cache-prompt \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 64 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --offline
 ```
 
 ```json
@@ -1040,7 +2220,7 @@ Source: `historical180/mtp-screen32-20261005/control/configuration.json`, SHA256
 
 Source: `http-baseline6-cache32-vision-20261004/configuration.json`, SHA256 `8c8829a8ee0b31c41962533e19d9b0a63b15fdba5e9d67fe24a53c1eb3236f03`.
 
-```text
+```sh
 Command unavailable in the recorded artifact
 ```
 
@@ -1048,7 +2228,7 @@ Command unavailable in the recorded artifact
 
 Source: `http-batch1024-cache32-vision-20261005/configuration.json`, SHA256 `3d371913a816640ec1877fc7cbdc45bc7460396dbb7a37f4be456c5518e7fd2b`.
 
-```text
+```sh
 Command unavailable in the recorded artifact
 ```
 
@@ -1056,7 +2236,7 @@ Command unavailable in the recorded artifact
 
 Source: `http-context32-cache32-u1024-20261005/configuration.json`, SHA256 `53b018526e9b800739dce80320aab9d1f4873f549440c1609ff274e79c6756cd`.
 
-```text
+```sh
 Command unavailable in the recorded artifact
 ```
 
@@ -1064,7 +2244,7 @@ Command unavailable in the recorded artifact
 
 Source: `http-threads14-cache32-vision-20261004/configuration.json`, SHA256 `f2a316eff1d06613abb33796f06a6809a7fe92b1fe3a51c45acee4758447681e`.
 
-```text
+```sh
 Command unavailable in the recorded artifact
 ```
 
@@ -1072,40 +2252,216 @@ Command unavailable in the recorded artifact
 
 Source: `ik178/results/control32-noMTP/summary.json`, SHA256 `9b9be58d9282469e9c2aba8149c325b6a58226fe8d4ed47a845edb502d3be76c`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14029 --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 43 --no-mmap --defer-ple --flash-attn on --cache-type-k f16 --cache-type-v f16 --threads 14 --threads-batch 14 --cpu-mask 0xffff --batch-size 8192 --ubatch-size 8192 --temp 1 --top-p .95 --top-k 20 --min-p 0 --presence-penalty 0 --repeat-penalty 1 --jinja --metrics --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14029 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-mmap \
+  --defer-ple \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1 \
+  --top-p .95 \
+  --top-k 20 \
+  --min-p 0 \
+  --presence-penalty 0 \
+  --repeat-penalty 1 \
+  --jinja \
+  --metrics \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C030 — ik178/results/mtp32-n1
 
 Source: `ik178/results/mtp32-n1/summary.json`, SHA256 `3a806194e6fb5f40482c99875e9d4515b995d654195f487ffff2c8e3c82fedba`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14029 --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 43 --no-mmap --defer-ple --flash-attn on --cache-type-k f16 --cache-type-v f16 --threads 14 --threads-batch 14 --cpu-mask 0xffff --batch-size 8192 --ubatch-size 8192 --temp 1 --top-p .95 --top-k 20 --min-p 0 --presence-penalty 0 --repeat-penalty 1 --jinja --metrics --no-context-shift --timeout 7200 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-type mtp:n_max=1,p_min=0.0 --cache-type-k-draft f16 --cache-type-v-draft f16 --threads-draft 14 --threads-batch-draft 14
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14029 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-mmap \
+  --defer-ple \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1 \
+  --top-p .95 \
+  --top-k 20 \
+  --min-p 0 \
+  --presence-penalty 0 \
+  --repeat-penalty 1 \
+  --jinja \
+  --metrics \
+  --no-context-shift \
+  --timeout 7200 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-type mtp:n_max=1,p_min=0.0 \
+  --cache-type-k-draft f16 \
+  --cache-type-v-draft f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14
 ```
 
 ### C031 — ik178/results/mtp32-n1-draftU512
 
 Source: `ik178/results/mtp32-n1-draftU512/summary.json`, SHA256 `6136b95fc0c866ba4e61fbf3487405d6ee451b17ea050a65a16c10a5ddcc7bcc`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14029 --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 43 --no-mmap --defer-ple --flash-attn on --cache-type-k f16 --cache-type-v f16 --threads 14 --threads-batch 14 --cpu-mask 0xffff --batch-size 8192 --ubatch-size 8192 --temp 1 --top-p .95 --top-k 20 --min-p 0 --presence-penalty 0 --repeat-penalty 1 --jinja --metrics --no-context-shift --timeout 7200 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-type mtp:n_max=1,p_min=0.0 --cache-type-k-draft f16 --cache-type-v-draft f16 --threads-draft 14 --threads-batch-draft 14 --draft-params '--ubatch-size 512'
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14029 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-mmap \
+  --defer-ple \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1 \
+  --top-p .95 \
+  --top-k 20 \
+  --min-p 0 \
+  --presence-penalty 0 \
+  --repeat-penalty 1 \
+  --jinja \
+  --metrics \
+  --no-context-shift \
+  --timeout 7200 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-type mtp:n_max=1,p_min=0.0 \
+  --cache-type-k-draft f16 \
+  --cache-type-v-draft f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --draft-params \
+  '--ubatch-size 512'
 ```
 
 ### C032 — ik178/results/mtp32-n1-mainU4096-draftU512
 
 Source: `ik178/results/mtp32-n1-mainU4096-draftU512/summary.json`, SHA256 `37c8d10eb66e50bd0774a19f93ab523e39249403d4c38acdafd0988ebff3986d`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14029 --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 43 --no-mmap --defer-ple --flash-attn on --cache-type-k f16 --cache-type-v f16 --threads 14 --threads-batch 14 --cpu-mask 0xffff --batch-size 8192 --ubatch-size 4096 --temp 1 --top-p .95 --top-k 20 --min-p 0 --presence-penalty 0 --repeat-penalty 1 --jinja --metrics --no-context-shift --timeout 7200 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-type mtp:n_max=1,p_min=0.0 --cache-type-k-draft f16 --cache-type-v-draft f16 --threads-draft 14 --threads-batch-draft 14 --draft-params '--ubatch-size 512'
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14029 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-mmap \
+  --defer-ple \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --batch-size 8192 \
+  --ubatch-size 4096 \
+  --temp 1 \
+  --top-p .95 \
+  --top-k 20 \
+  --min-p 0 \
+  --presence-penalty 0 \
+  --repeat-penalty 1 \
+  --jinja \
+  --metrics \
+  --no-context-shift \
+  --timeout 7200 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-type mtp:n_max=1,p_min=0.0 \
+  --cache-type-k-draft f16 \
+  --cache-type-v-draft f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --draft-params \
+  '--ubatch-size 512'
 ```
 
 ### C033 — iq3-author32-accept-20261005
 
 Source: `iq3-author32-accept-20261005/author-control/configuration.json`, SHA256 `3e804083f04371e0fd259245f4c8e7327d54917604cdd3d8237aaa59d90d84f4`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14024 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 48 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 6 --threads-batch 6 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 2048 --ubatch-size 512 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14024 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 48 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 6 \
+  --threads-batch 6 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1121,8 +2477,54 @@ Source: `iq3-author32-accept-20261005/author-control/configuration.json`, SHA256
 
 Source: `iq3-author32-accept-20261005/author-cpu-mtp1/configuration.json`, SHA256 `c5173776d3d6a455bd55c3b9bdc541505bbd39a1e90a6da1832a17183ce1e487`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14024 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 48 --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 0 --spec-type draft-mtp --spec-draft-n-max 1 --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 6 --threads-batch 6 --threads-draft 6 --threads-batch-draft 6 --cpu-mask 0xffff --cpu-strict 1 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 2048 --ubatch-size 512 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14024 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 48 \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 0 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 6 \
+  --threads-batch 6 \
+  --threads-draft 6 \
+  --threads-batch-draft 6 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1138,8 +2540,47 @@ Source: `iq3-author32-accept-20261005/author-cpu-mtp1/configuration.json`, SHA25
 
 Source: `iq3-cache96-accept-20261005/cache96-control/configuration.json`, SHA256 `9d078f937789dd7fcbacb68dcd9e5be6b4c9b1d57ed111bce03e2f8561eef3b8`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14024 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 96 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 6 --threads-batch 6 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 2048 --ubatch-size 512 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14024 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 96 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 6 \
+  --threads-batch 6 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1155,8 +2596,47 @@ Source: `iq3-cache96-accept-20261005/cache96-control/configuration.json`, SHA256
 
 Source: `iq3-cache96-t14-u4096-accept-r1-20261005/cache96-t14-u4096-control/configuration.json`, SHA256 `e388672909f4b19d48eabc736a2a03fee5bf24de9684c83e019b47db4a259d59`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14025 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 96 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 4096 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14025 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 96 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1172,8 +2652,50 @@ Source: `iq3-cache96-t14-u4096-accept-r1-20261005/cache96-t14-u4096-control/conf
 
 Source: `opt181/results/opt256-cache4g-ple-overlap-workspace/summary.json`, SHA256 `d81e16005e2f64a28c0d74ed8db3ed02166a0840fd0895471a30b9ea7f3b9d4c`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14030 --spec-type none --gpu-layers 99 --n-cpu-moe 48 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200 --moe-expert-cache-mib 4096 --phase-aware-workspace --live-context-workspace --ple-prefetch --backend-sampling --decode-overlap
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14030 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200 \
+  --moe-expert-cache-mib 4096 \
+  --phase-aware-workspace \
+  --live-context-workspace \
+  --ple-prefetch \
+  --backend-sampling \
+  --decode-overlap
 ```
 
 ```json
@@ -1190,8 +2712,47 @@ Source: `opt181/results/opt256-cache4g-ple-overlap-workspace/summary.json`, SHA2
 
 Source: `placement-speed175-20261005/placement-control-mmap/configuration.json`, SHA256 `fb9c4186871f22d7bce37aad37f53dcfa9fbf0c4bda8f66d124bee4c38e959db`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1208,8 +2769,47 @@ Source: `placement-speed175-20261005/placement-control-mmap/configuration.json`,
 
 Source: `placement-speed175-20261005/placement-none-lazy/configuration.json`, SHA256 `a143594576931cc78494a307d838d0347f5521095448220c455e98ad540f42ce`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1226,8 +2826,47 @@ Source: `placement-speed175-20261005/placement-none-lazy/configuration.json`, SH
 
 Source: `placement-speed175-r1-20261005/placement-none-lazy/configuration.json`, SHA256 `a143594576931cc78494a307d838d0347f5521095448220c455e98ad540f42ce`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1244,8 +2883,47 @@ Source: `placement-speed175-r1-20261005/placement-none-lazy/configuration.json`,
 
 Source: `placement-speed175-r2-20261005/placement-none-lazy/configuration.json`, SHA256 `a143594576931cc78494a307d838d0347f5521095448220c455e98ad540f42ce`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 80 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 80 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1262,8 +2940,59 @@ Source: `placement-speed175-r2-20261005/placement-none-lazy/configuration.json`,
 
 Source: `prefill-dma175-20261005/uncached-hybrid42-mtp2-pinned/configuration.json`, SHA256 `ac4d4df09305f0d1ea50f9cdfd7559869fd93c5ccc0d9c450d82fabec915b75a`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 42 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 42 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -1280,8 +3009,59 @@ Source: `prefill-dma175-20261005/uncached-hybrid42-mtp2-pinned/configuration.jso
 
 Source: `prefill-finalist175-20261005/pinned-hybrid43-mtp2-f16/configuration.json`, SHA256 `efcf44f8d07f15a7be2b26bf68ad5d3bf578976ac2138fa6887b72c012f4aded`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 43 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -1298,8 +3078,59 @@ Source: `prefill-finalist175-20261005/pinned-hybrid43-mtp2-f16/configuration.jso
 
 Source: `prefill-finalist175-20261005/pinned-hybrid43-mtp2-q8/configuration.json`, SHA256 `12424a7e77d263f241d71201b3b444bc4a48910c534f9a56b66db1836b1941b2`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 43 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -1316,8 +3147,47 @@ Source: `prefill-finalist175-20261005/pinned-hybrid43-mtp2-q8/configuration.json
 
 Source: `prefill-hybrid175-20261005/uncached-hybrid38/configuration.json`, SHA256 `c48fbe8bfcb4ad25e7d1d3be3c5917c398cd08658abce552421eec11f4a8bef7`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type none --gpu-layers 99 --n-cpu-moe 38 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 38 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1334,8 +3204,59 @@ Source: `prefill-hybrid175-20261005/uncached-hybrid38/configuration.json`, SHA25
 
 Source: `prefill-hybrid175-20261005/uncached-hybrid42-mtp2/configuration.json`, SHA256 `9328fdac61cc49145f4c01e2ce8a7027410b353089688b2013c6798d440eee8f`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 42 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 2 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 42 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -1352,8 +3273,59 @@ Source: `prefill-hybrid175-20261005/uncached-hybrid42-mtp2/configuration.json`, 
 
 Source: `prefill-kv175-20261005/pinned-hybrid43-mtp3-f16/configuration.json`, SHA256 `59c0bdd22f64f5c7e277be3c4a09f4ad1ab33607d2671c5de72ed528b58a76a8`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 43 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 3 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 3 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -1370,8 +3342,59 @@ Source: `prefill-kv175-20261005/pinned-hybrid43-mtp3-f16/configuration.json`, SH
 
 Source: `prefill-kv175-20261005/pinned-hybrid43-mtp3-q8/configuration.json`, SHA256 `be9f2454261d69f8c89d06cf18b9dd83fa40920bffedc1a3e52e5546c8ab2bb9`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 43 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 3 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 3 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -1388,8 +3411,59 @@ Source: `prefill-kv175-20261005/pinned-hybrid43-mtp3-q8/configuration.json`, SHA
 
 Source: `prefill-mtp1-finalist175-20261005/pinned-hybrid43-mtp1-f16/configuration.json`, SHA256 `6c6690ef429d3cfea4c6be1478e6cd4d845910b0011fa79555987b5cae772fd8`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type draft-mtp --gpu-layers 99 --n-cpu-moe 43 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' --gpu-layers-draft 99 --spec-draft-n-max 1 --spec-draft-n-min 0 --spec-draft-type-k f16 --spec-draft-type-v f16 --threads-draft 14 --threads-batch-draft 14 --cpu-mask-draft 0xffff --cpu-strict-draft 1 --cpu-mask-batch-draft 0xffff --cpu-strict-batch-draft 1
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type draft-mtp \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --model-draft '<PATH>/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf' \
+  --gpu-layers-draft 99 \
+  --spec-draft-n-max 1 \
+  --spec-draft-n-min 0 \
+  --spec-draft-type-k f16 \
+  --spec-draft-type-v f16 \
+  --threads-draft 14 \
+  --threads-batch-draft 14 \
+  --cpu-mask-draft 0xffff \
+  --cpu-strict-draft 1 \
+  --cpu-mask-batch-draft 0xffff \
+  --cpu-strict-batch-draft 1
 ```
 
 ```json
@@ -1406,8 +3480,47 @@ Source: `prefill-mtp1-finalist175-20261005/pinned-hybrid43-mtp1-f16/configuratio
 
 Source: `prefill-path175-20261005/uncached-cpu99/configuration.json`, SHA256 `1f8498aaa5c872a416120bd1dbd5ba24f7b701126233813fa09b7deb5642f35c`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload --alias jarvis-flash-next --host 127.0.0.1 --port 14026 --moe-cache-profile '<PATH>/routing-merged.csv' --moe-cache-slots 0 --spec-type none --gpu-layers 99 --n-cpu-moe 99 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode mmap --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14026 \
+  --moe-cache-profile '<PATH>/routing-merged.csv' \
+  --moe-cache-slots 0 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline
 ```
 
 ```json
@@ -1424,63 +3537,318 @@ Source: `prefill-path175-20261005/uncached-cpu99/configuration.json`, SHA256 `1f
 
 Source: `upstream178/results/control32-noMTP/summary.json`, SHA256 `5c0debeab732d308cd55543ee0d9dd135d76dde4915bbcd1eedf0b36f47cb23f`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14028 --moe-cache-profile '<PATH>/routing-iq3-175.csv' --moe-cache-slots 0 --spec-type none --gpu-layers 99 --n-cpu-moe 43 --no-sched-async-cpu --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14028 \
+  --moe-cache-profile '<PATH>/routing-iq3-175.csv' \
+  --moe-cache-slots 0 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --no-sched-async-cpu \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C052 — upstream178/results/upstream256-cpu43-u2048-noMTP
 
 Source: `upstream178/results/upstream256-cpu43-u2048-noMTP/summary.json`, SHA256 `46a8cfacb8e8799cc45e0c8a11a29d64ebef40ef180086b84f77ea781d07df2c`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14028 --spec-type none --gpu-layers 99 --n-cpu-moe 43 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 2048 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14028 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 2048 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C053 — upstream178/results/upstream256-cpu46-u4096-deep179
 
 Source: `upstream178/results/upstream256-cpu46-u4096-deep179/summary.json`, SHA256 `364bfb1390edb821e2b87e1921af4f340f17d0c7f291d447b793c03437bbdf27`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14028 --spec-type none --gpu-layers 99 --n-cpu-moe 46 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14028 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 46 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C054 — upstream178/results/upstream256-cpu46-u4096-short179
 
 Source: `upstream178/results/upstream256-cpu46-u4096-short179/summary.json`, SHA256 `9b0adac2f2dbff4be04fddef2aa90b094caafd2f1c217a6711956c6453044ef0`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14028 --spec-type none --gpu-layers 99 --n-cpu-moe 46 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14028 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 46 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C055 — upstream178/results/upstream256-f16-noMTP
 
 Source: `upstream178/results/upstream256-f16-noMTP/summary.json`, SHA256 `c999cba80d5ade26cfb4b9e93f63295854dd7118644150a8cc7967b10c881c6a`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14028 --spec-type none --gpu-layers 99 --n-cpu-moe 48 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14028 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C056 — upstream178/results/upstream256-noMTP
 
 Source: `upstream178/results/upstream256-noMTP/summary.json`, SHA256 `d6f234b71ffcd674d84abb60a8e9585f00628fe063ee50b2d449d661108e431b`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14028 --spec-type none --gpu-layers 99 --n-cpu-moe 48 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 4096 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14028 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 4096 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C057 — upstream178/results/upstream32-noMTP
 
 Source: `upstream178/results/upstream32-noMTP/summary.json`, SHA256 `2bdd58a9329b42a8d1800349601c64370732f230d6809f4622dd91d5a33bf7bc`.
 
-```text
-'<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14028 --spec-type none --gpu-layers 99 --n-cpu-moe 43 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 32768 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 8192 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --verbosity 4 --offline --no-context-shift --timeout 7200
+```sh
+'<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14028 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 43 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200
 ```
 
 ### C058 — historical180/benchmarks-20261004/cache-c32-t14-a1-20261004T214318Z-578888
 
 Source: `historical180/benchmarks-20261004/cache-c32-t14-a1-20261004T214318Z-578888/provenance.txt`, SHA256 `a75b75c63cacb66eb5eaf2fc0b3f1a52323ea4337b17bc0fdd67e264ed453b56`.
 
-```text
+```sh
 utc=2026-10-04T21:43:18Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=cache
@@ -1509,7 +3877,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/cache-c40-t14-a1-20261004T214501Z-581674/provenance.txt`, SHA256 `1cc229adab87896c90605bffdbe26a22ad5920446af4cf3ad546adf81eb7b42d`.
 
-```text
+```sh
 utc=2026-10-04T21:45:01Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=cache
@@ -1538,7 +3906,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/cache-c48-t14-a1-20261004T214653Z-584724/provenance.txt`, SHA256 `bdea10d216c872f6e161212eb146c8e1f87be49194ad90b82403af34971b8e4f`.
 
-```text
+```sh
 utc=2026-10-04T21:46:53Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=cache
@@ -1567,7 +3935,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/overlap-c48-t14-a0-20261004T214842Z-587507/provenance.txt`, SHA256 `4028072afa973d2cd48dc5db011c0da2873ca854b641766c9e1b076f948d207a`.
 
-```text
+```sh
 utc=2026-10-04T21:48:42Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=overlap
@@ -1596,7 +3964,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/overlap-c48-t14-a1-20261004T215031Z-590180/provenance.txt`, SHA256 `b298e7d289fcf5f9e5f0d43a6ba7565a740f2664e942d0506ad0401057f1178d`.
 
-```text
+```sh
 utc=2026-10-04T21:50:31Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=overlap
@@ -1625,7 +3993,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b1024-u1024-pf0-20261004T223734Z-660149/provenance.txt`, SHA256 `10eb52c1c889a53ebbf2c780c20a4db623d6ed09709bc78336616aba484d9b28`.
 
-```text
+```sh
 utc=2026-10-04T22:37:34Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1658,7 +4026,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b1024-u128-pf0-20261004T223048Z-649423/provenance.txt`, SHA256 `60ddd1ff29bbc3f859c6ba9386653f02813d30c39bc8e3285ea7c065504f8b56`.
 
-```text
+```sh
 utc=2026-10-04T22:30:48Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1691,7 +4059,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b1024-u256-pf0-20261004T223403Z-654270/provenance.txt`, SHA256 `5e50859a1dda06bbe235fb57b53cb95e66454ea021c70713db9fb1893a31b12c`.
 
-```text
+```sh
 utc=2026-10-04T22:34:03Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1724,7 +4092,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b1024-u512-pf0-20261004T223610Z-657788/provenance.txt`, SHA256 `83ca1734bde8768fddb14ac16f62346b944830adc10b85ec83f20d664e4d33f8`.
 
-```text
+```sh
 utc=2026-10-04T22:36:10Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1757,7 +4125,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b2048-u1024-pf0-20261004T224515Z-669667/provenance.txt`, SHA256 `67954303ce91a62534d67d9bb34c85fac95a6d5fd2dc9344f79def7fdebfa1f0`.
 
-```text
+```sh
 utc=2026-10-04T22:45:15Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1790,7 +4158,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b2048-u1024-pf2-20261005T060634Z-977668/provenance.txt`, SHA256 `ded5755269689995cbfaa4c720f855164ecbb34a966534f372343147d9e0a11c`.
 
-```text
+```sh
 utc=2026-10-05T06:06:34Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1822,7 +4190,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b2048-u128-pf0-20261004T223830Z-661175/provenance.txt`, SHA256 `9c5e0797536c61dc31b2b3e52b0753750642f463c5230af34ed4b0d12f5ef6e6`.
 
-```text
+```sh
 utc=2026-10-04T22:38:30Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1855,7 +4223,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b2048-u256-pf0-20261004T224144Z-665751/provenance.txt`, SHA256 `7fafec9133078a09d3b4c43fef6821fd41ab8a0f76f21b2b0c4abd7c41fa7c0d`.
 
-```text
+```sh
 utc=2026-10-04T22:41:44Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1888,7 +4256,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b2048-u512-pf0-20261004T224351Z-668259/provenance.txt`, SHA256 `7b31b74c73c4830d3dd4308ecc2f828c8d2529acd0e6802c4a366481c46d975d`.
 
-```text
+```sh
 utc=2026-10-04T22:43:51Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1921,7 +4289,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b4096-u1024-pf0-20261004T225256Z-677442/provenance.txt`, SHA256 `50d2c7c3d472cc46ed00e3708febe6648a4248ab4779cdfd9d00ab92b3a24d94`.
 
-```text
+```sh
 utc=2026-10-04T22:52:56Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1954,7 +4322,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b4096-u128-pf0-20261004T224611Z-670693/provenance.txt`, SHA256 `2fdbfe20ee2e6c7a6f89ff4c3775842acef90689bf9d5ce6337a2f0d363c5269`.
 
-```text
+```sh
 utc=2026-10-04T22:46:11Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -1987,7 +4355,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b4096-u256-pf0-20261004T224925Z-673871/provenance.txt`, SHA256 `3da7a5d4f4d8fd0a785e9dc784390077fed1874976d86337143957b86826eb91`.
 
-```text
+```sh
 utc=2026-10-04T22:49:25Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -2020,7 +4388,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b4096-u512-pf0-20261004T225132Z-676022/provenance.txt`, SHA256 `227772b1dfa903c8a503f7e0a76118d382a6c169ab9ae1fbffaacaa61647a4d2`.
 
-```text
+```sh
 utc=2026-10-04T22:51:32Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -2053,7 +4421,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b512-u128-pf0-20261004T222319Z-634105/provenance.txt`, SHA256 `97a389fef86bcf01e82875ade5af70877cf084acd9be0808aebb2ff2571324fa`.
 
-```text
+```sh
 utc=2026-10-04T22:23:19Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -2086,7 +4454,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b512-u256-pf0-20261004T222716Z-642697/provenance.txt`, SHA256 `d584ba4aaee934d05890bb082e13fde9c0ebd17f96d982bf668389199d3b489b`.
 
-```text
+```sh
 utc=2026-10-04T22:27:16Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -2119,7 +4487,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/prefill-c32-t14-a1-b512-u512-pf0-20261004T222924Z-646700/provenance.txt`, SHA256 `52eae6326dfa74e90830f7061d34417f161256147c90e25b6a45592815e57185`.
 
-```text
+```sh
 utc=2026-10-04T22:29:24Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=prefill
@@ -2152,7 +4520,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-20261004/threads-c32-t4-6-8-12-14-16-a1-20261004T213654Z-567469/provenance.txt`, SHA256 `a1a07a5796fcd6e50e178220c8f210b548dd0f9ed531e5ecebe2058bf9132219`.
 
-```text
+```sh
 utc=2026-10-04T21:36:54Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=threads
@@ -2181,7 +4549,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-pp8192-20261005/pp8192-c48-t14-a0-b8192-u8192-20261005T073938Z-1096850/provenance.txt`, SHA256 `76b7cff805c169c65d80bb8158651957579d595466c4c3c40a4057600527e837`.
 
-```text
+```sh
 utc=2026-10-05T07:39:38Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=pp8192
@@ -2211,7 +4579,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c48-t14-a0-b2048-u2048-nopo0-20261005T064446Z-1028912/provenance.txt`, SHA256 `8de5eb652b9a96fb7ab771036360e232b4fcdd490c8cafcf74b011412a9d7ae1`.
 
-```text
+```sh
 utc=2026-10-05T06:44:46Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2241,7 +4609,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c48-t14-a0-b4096-u2048-nopo0-20261005T064617Z-1031775/provenance.txt`, SHA256 `329446d3530a905f50e044c5d5d05ad36d470b71c5f1ed53270619fff03c894d`.
 
-```text
+```sh
 utc=2026-10-05T06:46:17Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2271,7 +4639,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c48-t14-a0-b4096-u4096-nopo0-20261005T064730Z-1034279/provenance.txt`, SHA256 `152d2cc76bdebe4ca487e23e9298de41c3e1c325b32c611b0e5113b6df0c996a`.
 
-```text
+```sh
 utc=2026-10-05T06:47:30Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2301,7 +4669,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c64-t14-a0-b2048-u2048-nopo0-20261005T064835Z-1036566/provenance.txt`, SHA256 `cd1b90794e92d64eac23a19147306fe9ba74ac99d97821ac64fed28538571086`.
 
-```text
+```sh
 utc=2026-10-05T06:48:35Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2331,7 +4699,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c64-t14-a0-b4096-u2048-nopo0-20261005T064948Z-1038971/provenance.txt`, SHA256 `f0377fe7569f5ddd616ccaeb0d7fb78697d80a754dadb7b680d06d5d35fa447d`.
 
-```text
+```sh
 utc=2026-10-05T06:49:48Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2361,7 +4729,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c64-t14-a0-b4096-u4096-nopo0-20261005T065101Z-1041105/provenance.txt`, SHA256 `7deecda7d7122c7e6ce7c260d8e9d4654d136dec0cf9cf797cc19cf220c75693`.
 
-```text
+```sh
 utc=2026-10-05T06:51:01Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2391,7 +4759,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c80-t14-a0-b2048-u2048-nopo0-20261005T065205Z-1042879/provenance.txt`, SHA256 `10bc97868340c30498eddc10904bd017aa0176f4a8a51fcf679088bf43e2637c`.
 
-```text
+```sh
 utc=2026-10-05T06:52:05Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2421,7 +4789,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c80-t14-a0-b4096-u2048-nopo0-20261005T065318Z-1044457/provenance.txt`, SHA256 `11f777426880217c84a2b9e54efa850654c935af256d2d3b3f57845309cb57c8`.
 
-```text
+```sh
 utc=2026-10-05T06:53:18Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2451,7 +4819,7 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `historical180/benchmarks-speed-20261005/speed-c80-t14-a0-b4096-u4096-nopo0-20261005T065430Z-1047277/provenance.txt`, SHA256 `a0bbd27aba47bb47a2a617483fede87239d30d32cd2a6ddc477d10cfe45494da`.
 
-```text
+```sh
 utc=2026-10-05T06:54:30Z
 source_commit=27c54b4bbcefadedcec6397477cc2e866c1db716
 phase=speed
@@ -2481,8 +4849,30 @@ command=<PATH>/llama-bench -m <PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-0000
 
 Source: `profile-iq3-175-r1-20261005/chat.configuration.json`, SHA256 `0bfcdd54605c7874477e266e07d26c668d51fb060870b67f0bc3a2ba33bd4e11`.
 
-```text
-'<PATH>/llama-moe-trace' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --offline --fit off --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 99 --load-mode mmap --lazy-mode on --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --batch-size 8192 --ubatch-size 8192 --moe-cache-slots 0 --no-escape --file '<PATH>/chat.prompt.txt' --n-predict 512
+```sh
+'<PATH>/llama-moe-trace' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --offline \
+  --fit off \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --moe-cache-slots 0 \
+  --no-escape \
+  --file '<PATH>/chat.prompt.txt' \
+  --n-predict 512
 ```
 
 ```json
@@ -2500,8 +4890,30 @@ Source: `profile-iq3-175-r1-20261005/chat.configuration.json`, SHA256 `0bfcdd546
 
 Source: `profile-iq3-175-r1-20261005/code.configuration.json`, SHA256 `dfcb2a4679ff720432d2cea8d88d70bf5119be1737066b787f022cb101bb16b8`.
 
-```text
-'<PATH>/llama-moe-trace' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --offline --fit off --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 99 --load-mode mmap --lazy-mode on --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --batch-size 8192 --ubatch-size 8192 --moe-cache-slots 0 --no-escape --file '<PATH>/code.prompt.txt' --n-predict 512
+```sh
+'<PATH>/llama-moe-trace' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --offline \
+  --fit off \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --moe-cache-slots 0 \
+  --no-escape \
+  --file '<PATH>/code.prompt.txt' \
+  --n-predict 512
 ```
 
 ```json
@@ -2519,8 +4931,30 @@ Source: `profile-iq3-175-r1-20261005/code.configuration.json`, SHA256 `dfcb2a467
 
 Source: `profile-iq3-175-r1-20261005/tools.configuration.json`, SHA256 `e2f3a79012392d2102af27dd3a6627a755d8774ac43962bac5df000716bbea73`.
 
-```text
-'<PATH>/llama-moe-trace' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --offline --fit off --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 99 --load-mode mmap --lazy-mode on --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --batch-size 8192 --ubatch-size 8192 --moe-cache-slots 0 --no-escape --file '<PATH>/tools.prompt.txt' --n-predict 512
+```sh
+'<PATH>/llama-moe-trace' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --offline \
+  --fit off \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --moe-cache-slots 0 \
+  --no-escape \
+  --file '<PATH>/tools.prompt.txt' \
+  --n-predict 512
 ```
 
 ```json
@@ -2538,8 +4972,31 @@ Source: `profile-iq3-175-r1-20261005/tools.configuration.json`, SHA256 `e2f3a790
 
 Source: `historical180/profile-iq3-175-20261005/code.configuration.json`, SHA256 `cd00480ee4e11c8c6b73511fde9fb2ae43c67c9036d23a2733ef1042118cbe8a`.
 
-```text
-'<PATH>/llama-moe-trace' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --offline --fit off --ctx-size 32768 --parallel 1 --gpu-layers 99 --n-cpu-moe 99 --load-mode mmap --lazy-mode on --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --batch-size 8192 --ubatch-size 8192 --moe-cache-slots 0 --spec-type none --no-escape --file '<PATH>/code.prompt.txt' --n-predict 512
+```sh
+'<PATH>/llama-moe-trace' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --offline \
+  --fit off \
+  --ctx-size 32768 \
+  --parallel 1 \
+  --gpu-layers 99 \
+  --n-cpu-moe 99 \
+  --load-mode mmap \
+  --lazy-mode on \
+  --flash-attn on \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --batch-size 8192 \
+  --ubatch-size 8192 \
+  --moe-cache-slots 0 \
+  --spec-type none \
+  --no-escape \
+  --file '<PATH>/code.prompt.txt' \
+  --n-predict 512
 ```
 
 ```json
@@ -2557,8 +5014,21 @@ Source: `historical180/profile-iq3-175-20261005/code.configuration.json`, SHA256
 
 Source: `jarvis-flash174/report/strata188/summary.json`, SHA256 `208db26d4d20937ae638a1dee16b498ce9902aef909e834224ed87402ef69781`.
 
-```text
-'<PATH>/strata' --pack '<PATH>/unsloth-ud-q4_k_xl' --native '<PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf' --expert-profile '<PATH>/expert-profile.bin' --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp '<PATH>/rt' --max-context 262144 --kv int8 --kv-resident 32768 --resident-budget-gib 62 --vram-reserve-mib 12288
+```sh
+'<PATH>/strata' \
+  --pack '<PATH>/unsloth-ud-q4_k_xl' \
+  --native '<PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf' \
+  --expert-profile '<PATH>/expert-profile.bin' \
+  --expert-cache auto \
+  --prefill auto \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp '<PATH>/rt' \
+  --max-context 262144 \
+  --kv int8 \
+  --kv-resident 32768 \
+  --resident-budget-gib 62 \
+  --vram-reserve-mib 12288
 ```
 
 Runtime-effective parameters:
@@ -2588,8 +5058,21 @@ Cgroup limits: MemoryMax 80 GiB; MemorySwapMax 0 GiB.
 
 Source: `jarvis-flash174/report/strata188-ram48/summary.json`, SHA256 `99909693256ef583e4ff73f4ac20b68e2a6c7981e25e4baf6d836e720d90e0e7`.
 
-```text
-'<PATH>/strata' --pack '<PATH>/unsloth-ud-q4_k_xl' --native '<PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf' --expert-profile '<PATH>/expert-profile.bin' --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp '<PATH>/rt' --max-context 262144 --kv int8 --kv-resident 32768 --resident-budget-gib 24 --vram-reserve-mib 12288
+```sh
+'<PATH>/strata' \
+  --pack '<PATH>/unsloth-ud-q4_k_xl' \
+  --native '<PATH>/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf' \
+  --expert-profile '<PATH>/expert-profile.bin' \
+  --expert-cache auto \
+  --prefill auto \
+  --spec 4 \
+  --spec-min-p 0.5 \
+  --mtp '<PATH>/rt' \
+  --max-context 262144 \
+  --kv int8 \
+  --kv-resident 32768 \
+  --resident-budget-gib 24 \
+  --vram-reserve-mib 12288
 ```
 
 Cgroup limits: MemoryMax 48 GiB; MemorySwapMax 0 GiB.
@@ -2598,8 +5081,48 @@ Cgroup limits: MemoryMax 48 GiB; MemorySwapMax 0 GiB.
 
 Source: `jarvis-fixes195/native-request-timings.json`, SHA256 `8cd2b39ce8898270b97756846d956bbb4cbcf2aa04bd6e1057a1976ee9f3054b`.
 
-```text
-/usr/bin/env 'LD_LIBRARY_PATH=<PATH>/bin' '<PATH>/llama-server' --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' --alias jarvis-flash-next --host 127.0.0.1 --port 14004 --spec-type none --gpu-layers 99 --n-cpu-moe 48 --threads 14 --threads-batch 14 --cpu-mask 0xffff --cpu-strict 1 --load-mode none --lazy-mode on --fit off --flash-attn on --cache-type-k f16 --cache-type-v f16 --ctx-size 262144 --parallel 1 --cache-reuse 256 --cache-prompt --batch-size 8192 --ubatch-size 2048 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0.0 --repeat-penalty 1.0 --metrics --slots --jinja --chat-template-file '<PATH>/chat_template.jinja' --chat-template-kwargs '{"reasoning_effort":"xhigh"}' --verbosity 4 --offline --no-context-shift --timeout 7200 --mmproj '<PATH>/mmproj-F16.gguf' --no-mmproj-offload
+```sh
+/usr/bin/env 'LD_LIBRARY_PATH=<PATH>/bin' '<PATH>/llama-server' \
+  --model '<PATH>/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf' \
+  --alias jarvis-flash-next \
+  --host 127.0.0.1 \
+  --port 14004 \
+  --spec-type none \
+  --gpu-layers 99 \
+  --n-cpu-moe 48 \
+  --threads 14 \
+  --threads-batch 14 \
+  --cpu-mask 0xffff \
+  --cpu-strict 1 \
+  --load-mode none \
+  --lazy-mode on \
+  --fit off \
+  --flash-attn on \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --ctx-size 262144 \
+  --parallel 1 \
+  --cache-reuse 256 \
+  --cache-prompt \
+  --batch-size 8192 \
+  --ubatch-size 2048 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --repeat-penalty 1.0 \
+  --metrics \
+  --slots \
+  --jinja \
+  --chat-template-file '<PATH>/chat_template.jinja' \
+  --chat-template-kwargs '{"reasoning_effort":"xhigh"}' \
+  --verbosity 4 \
+  --offline \
+  --no-context-shift \
+  --timeout 7200 \
+  --mmproj '<PATH>/mmproj-F16.gguf' \
+  --no-mmproj-offload
 ```
 
 ## Appendix D. Build reference and artifact integrity
@@ -2620,6 +5143,10 @@ cmake -S "$stage/source" -B "$stage/build-cuda86" -G Ninja \
     -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
 ```
 
+```sh
+cmake --build "$stage/build-cuda86" --parallel 4 --target llama-server llama-bench
+```
+
 ### ik_llama.cpp
 
 Source: `jarvis-flash174/ik178-build.sh`, SHA256 `28656824d4842236b9924952fd2efda768269114c93bd0b6e1940031d6fd6f4a`.
@@ -2633,6 +5160,10 @@ cmake -S "$stage/source" -B "$stage/build-cuda86" -G Ninja \
     -DLLAMA_CURL=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
     -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+```
+
+```sh
+cmake --build "$stage/build-cuda86" --parallel 4 --target llama-server llama-bench test-chat-template test-chat-auto-parser
 ```
 
 ### OptLlama
@@ -2651,6 +5182,11 @@ cmake -S "$stage/source" -B "$stage/build-cuda86" -G Ninja \
     -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
 ```
 
+```sh
+cmake --build "$stage/build-cuda86" --parallel 4 \
+    --target llama-server llama-bench test-chat-template test-chat-auto-parser
+```
+
 ### Strata
 
 Source: `jarvis-flash174/strata188/build.sh`, SHA256 `62760e503314258134a5f84b010f605d8bba723a8465964fc505d2f5061c175b`.
@@ -2661,4 +5197,510 @@ cmake -S /source -B /output/build-cuda86 -G Ninja \
     -DSTRATA_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES=86 \
     -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
     -DSTRATA_GGML_DIR=/source/third_party/llama.cpp
+```
+
+```sh
+cmake --build /output/build-cuda86 --target strata --parallel 4
+```
+
+## Appendix E. Application components and request protocols
+
+The following settings identify the application, audio and transport components used alongside the inference tests. They are not interchangeable with the isolated engine protocol. Audio configurations are saved deployment settings, not a runtime dump for every phrase. [Machine-readable component and protocol reference](data/components-and-protocols.json).
+
+### llama-swap
+
+```json
+{
+  "name": "llama-swap",
+  "version": "262",
+  "role": "Backend process management and API proxy",
+  "source": {
+    "path": "jarvis-flash174/llama-swap/jarvis-llama-swap.service",
+    "bytes": 1296,
+    "sha256": "09d723312009b7c849589ebfe1ffe10c0795148cd37a4bcd5d311df31a68c1f7"
+  },
+  "argv": [
+    "<PATH>/llama-swap",
+    "--config",
+    "<PATH>/config.yaml",
+    "--listen",
+    "127.0.0.1:14003"
+  ],
+  "launch_command": "'<PATH>/llama-swap' \\\n  --config '<PATH>/config.yaml' \\\n  --listen 127.0.0.1:14003",
+  "unset_environment": [
+    "GGML_CUDA_REGISTER_HOST",
+    "GGML_SCHED_PREFETCH_EXPERTS",
+    "GGML_CUDA_ENABLE_UNIFIED_MEMORY"
+  ]
+}
+```
+
+### Nginx
+
+```json
+{
+  "name": "Nginx",
+  "role": "Streaming HTTPS/API proxy; system package",
+  "argv": [
+    "/usr/sbin/nginx",
+    "-c",
+    "<PATH>/nginx.conf",
+    "-g",
+    "daemon off;"
+  ],
+  "launch_command": "/usr/sbin/nginx \\\n  -c '<PATH>/nginx.conf' \\\n  -g 'daemon off;'",
+  "service_source": {
+    "path": "jarvis-flash174/switching/systemd/jarvis-api-proxy.service",
+    "bytes": 854,
+    "sha256": "9d571ff2411b6086a947c5b1b49abff3494e243cde07ccb286f8297a0ae18a1c"
+  },
+  "source": {
+    "path": "jarvis-flash174/switching/nginx/api-inference.conf",
+    "bytes": 4570,
+    "sha256": "50f00248eeb720ba8019cb841985d8fa450b125f8ab9d04952dd5b1b17e8211b"
+  },
+  "proxy_settings": {
+    "proxy_read_timeout": [
+      "1860s"
+    ],
+    "proxy_send_timeout": [
+      "60s"
+    ],
+    "send_timeout": [
+      "60s"
+    ],
+    "proxy_buffering": [
+      "off"
+    ],
+    "proxy_request_buffering": [
+      "on"
+    ],
+    "proxy_http_version": [
+      "1.1"
+    ],
+    "proxy_next_upstream": [
+      "off"
+    ],
+    "client_body_timeout": [
+      "30s"
+    ],
+    "client_header_timeout": [
+      "15s"
+    ],
+    "client_max_body_size": [
+      "5m",
+      "25m",
+      "1m"
+    ]
+  },
+  "settings_scope": "Values from the saved switching configuration; body limits differ by route; not a full request-time configuration dump"
+}
+```
+
+### LiteLLM
+
+```json
+{
+  "name": "LiteLLM",
+  "version": "1.104.0",
+  "role": "OpenAI Chat Completions / Responses gateway",
+  "image": "ghcr.io/berriai/litellm@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839",
+  "source": {
+    "path": "jarvis-api168/compose.yaml",
+    "bytes": 1845,
+    "sha256": "340f464733051bd4e44b4f3ee7efb490df8511d8dbf638eceec65ad6dda4a396"
+  },
+  "container_arguments": [
+    "--config",
+    "/app/jarvis-config.yaml",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "14000"
+  ],
+  "launch_scope": "Image default entrypoint plus recorded container arguments; not a replacement executable",
+  "limits": {
+    "cpus": 2,
+    "memory_GiB": 3,
+    "pids": 512
+  },
+  "configuration_source": {
+    "path": "jarvis-api168/config.yaml",
+    "bytes": 2511,
+    "sha256": "4f787cd766fb83edd4510e9b47de6244f8083b4819ac292466c28b1bf38704b6"
+  },
+  "settings": {
+    "num_retries": 0,
+    "request_timeout_seconds": 1860,
+    "drop_params": true,
+    "turn_off_message_logging": true,
+    "router_num_retries": 0,
+    "router_timeout_seconds": 1860
+  },
+  "functional_test_settings": {
+    "use_chat_completions_api": true,
+    "sse_keepalive_ping_interval_seconds": 15
+  },
+  "functional_settings_source": {
+    "path": "jarvis-fixes195/install_keepalive.py",
+    "bytes": 4374,
+    "sha256": "e1937aee89dbfd0b1a2c680e0db6983757756d0641ad6a01887eee05a492c591"
+  }
+}
+```
+
+### Codex CLI
+
+```json
+{
+  "name": "Codex CLI",
+  "version": "0.160.1",
+  "role": "Long-history, native compaction and tool-continuation client"
+}
+```
+
+### Pithagoras
+
+```json
+{
+  "name": "Pithagoras",
+  "repository": "https://github.com/thecodacus/Pithagoras",
+  "commit": "a14763d7f6172d632ebe8577ee2cb581d8e1ae2e",
+  "image": "ghcr.io/thecodacus/pithagoras@sha256:9c899f8675392e9b74005e09d27d9b4071efa1a5fbb18c7bba61e2a196e4ef07",
+  "pi_sdk_lock_version": "0.82.1",
+  "source_patches": false,
+  "role": "Agent / tool / voice integration; EXECUTOR=host inside an unprivileged workspace container",
+  "argv": [
+    "/usr/bin/docker",
+    "compose",
+    "--env-file",
+    "portal.env",
+    "-f",
+    "compose.yml",
+    "up",
+    "-d",
+    "--pull",
+    "never"
+  ],
+  "launch_command": "/usr/bin/docker compose \\\n  --env-file portal.env \\\n  -f compose.yml \\\n  up \\\n  -d \\\n  --pull never",
+  "service_source": {
+    "path": "jarvis-flash174/jarvis-pithagoras.service",
+    "bytes": 680,
+    "sha256": "a6c35ac063f39c25b9b40416496784bf31096b4a0c997422b20f80df4d381b03"
+  },
+  "compose_source": {
+    "path": "jarvis-flash174/voice/portal-compose.yml",
+    "bytes": 3953,
+    "sha256": "061f6330c8065540880199d163723dcdf2eb02b046cc34d853a6be2892bfcb69"
+  },
+  "working_directory": "<PATH>/pithagoras",
+  "settings": {
+    "VOICE_PIPELINE_MODE": "parallel",
+    "VOICE_SKIP_FIRST_THINKING": true,
+    "VOICE_STATUS_SPEECH": false
+  }
+}
+```
+
+### pi-web-access
+
+```json
+{
+  "name": "pi-web-access",
+  "repository": "https://github.com/nicobailon/pi-web-access",
+  "version": "0.35.0",
+  "commit": "72c6e67787d67d8a7d01bf0abf30c072a6112de6",
+  "sha256": "42e48533218d038d483cbd59c323aa2d7f50300b47f7c65954e9b9bcb40ee09e",
+  "role": "Stock search and document retrieval tools"
+}
+```
+
+### Chromium
+
+```json
+{
+  "name": "Chromium",
+  "repository": "https://github.com/chromedp/docker-headless-shell",
+  "image": "docker.io/chromedp/headless-shell@sha256:a6beb6f169686744e05912a3ae25d97ee808510c9370142b00c3eb38c983db0e",
+  "version_observed": "155.0.8059.26",
+  "role": "Headless browser; CPU/software rendering",
+  "argv": [
+    "/headless-shell/headless-shell",
+    "--remote-debugging-address=0.0.0.0",
+    "--remote-debugging-port=9223",
+    "--disable-gpu",
+    "--enable-unsafe-swiftshader",
+    "--headless",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--user-data-dir=/profile",
+    "about:blank"
+  ],
+  "launch_command": "/headless-shell/headless-shell \\\n  --remote-debugging-address=0.0.0.0 \\\n  --remote-debugging-port=9223 \\\n  --disable-gpu \\\n  --enable-unsafe-swiftshader \\\n  --headless \\\n  --no-first-run \\\n  --no-default-browser-check \\\n  --user-data-dir=/profile about:blank",
+  "source": {
+    "path": "jarvis-flash174/voice/portal-compose.yml",
+    "bytes": 3953,
+    "sha256": "061f6330c8065540880199d163723dcdf2eb02b046cc34d853a6be2892bfcb69"
+  },
+  "limits": {
+    "cpus": 2,
+    "memory_GiB": 2,
+    "shm_GiB": 1,
+    "pids": 256
+  },
+  "CDP_transport": {
+    "argv": [
+      "socat",
+      "TCP4-LISTEN:9222,fork,reuseaddr",
+      "TCP4:127.0.0.1:9223"
+    ],
+    "cpus": 0.5,
+    "memory_MiB": 128
+  }
+}
+```
+
+### audio.cpp
+
+```json
+{
+  "name": "audio.cpp",
+  "repository": "https://github.com/0xShug0/audio.cpp",
+  "release": "v0.9.0",
+  "commit": "795c45fbde0a7d29c93b22199728ff5caaec02e5",
+  "cuda_architecture": "86",
+  "source_patches": false,
+  "build_commands": [
+    "bash scripts/build_linux.sh --native-model-manager --system-openssl --cuda on --cuda-arch 86 --build-dir \"$source_dir/build-cuda\" --build-type Release --model-set custom --models chatterbox --target audiocpp_server --jobs 4",
+    "bash scripts/build_linux.sh --cuda off --build-dir \"$source_dir/build-cpu\" --build-type Release --model-set custom --models qwen3_asr --target audiocpp_server --jobs 4"
+  ],
+  "models": {
+    "repository": "audio-cpp/audio.cpp-gguf",
+    "revision": "6d5436fc85f7a20c2e9f4e472b7f3a532f686444",
+    "chatterbox": {
+      "file": "Chatterbox-GGUF/chatterbox-q8_0.gguf",
+      "bytes": 2088393668,
+      "sha256": "d586dd1aa59613cab8046176fb7ca5ba191c02a9b10ffa5b0d892ed22b470656"
+    },
+    "qwen3_asr": {
+      "file": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
+      "bytes": 1151272416,
+      "sha256": "6c44ec2fb4cee513892d7863c1fcc3ea6b699ffa4d899b0ef4ab19956d9544f7"
+    }
+  },
+  "tts": {
+    "source": {
+      "path": "jarvis-flash174/voice/jarvis-voice-tts.service",
+      "bytes": 713,
+      "sha256": "87090ca25a213dd16a2fd961c7cad6a68b1ff8fedfa54ceb782a70b271a930e7"
+    },
+    "argv": [
+      "<PATH>/audiocpp_server",
+      "--config",
+      "<PATH>/audio-tts.json",
+      "--no-ui"
+    ],
+    "launch_command": "'<PATH>/audiocpp_server' \\\n  --config '<PATH>/audio-tts.json' \\\n  --no-ui",
+    "environment": [
+      "CUDA_DEVICE_ORDER=PCI_BUS_ID",
+      "LD_LIBRARY_PATH=<PATH>/lib",
+      "CUDA_VISIBLE_DEVICES=0"
+    ],
+    "config_source": {
+      "path": "jarvis-flash174/voice/audio-tts.json",
+      "bytes": 607,
+      "sha256": "2705a142c2bf22fe4909f51f0db6df09f438c4cbc554f9949870c3fdcb363cef"
+    },
+    "configuration": {
+      "host": "127.0.0.1",
+      "port": 7862,
+      "backend": "cuda",
+      "device": 0,
+      "threads": 4,
+      "lazy_load": false,
+      "idle_unload_ms": 0,
+      "min_free_memory_mb": 2048,
+      "max_loaded_models": 1,
+      "ui": false,
+      "ui_management": true,
+      "log_request_body": false,
+      "models": [
+        {
+          "id": "chatterbox",
+          "family": "chatterbox",
+          "path": "<PATH>/chatterbox-q8_0.gguf",
+          "task": "clon",
+          "mode": "offline",
+          "session_options": {
+            "chatterbox.multilingual_t3": "v3",
+            "chatterbox.conditionals_cache_slots": "2"
+          }
+        }
+      ]
+    }
+  },
+  "asr": {
+    "source": {
+      "path": "jarvis-flash174/voice/jarvis-voice-asr.service",
+      "bytes": 624,
+      "sha256": "9f06274b1d4b83976c88594bcc0af376ae1c4bbbdd7d2e013b517f5d381373b9"
+    },
+    "argv": [
+      "<PATH>/audiocpp_server",
+      "--config",
+      "<PATH>/audio-asr.json",
+      "--no-ui"
+    ],
+    "launch_command": "'<PATH>/audiocpp_server' \\\n  --config '<PATH>/audio-asr.json' \\\n  --no-ui",
+    "environment": [
+      "CUDA_VISIBLE_DEVICES="
+    ],
+    "config_source": {
+      "path": "jarvis-flash174/voice/audio-asr.json",
+      "bytes": 428,
+      "sha256": "92f8250f4b5b623e734343d3d419eadebf411ed58523ef331d32e8311e1d7142"
+    },
+    "configuration": {
+      "host": "127.0.0.1",
+      "port": 7863,
+      "backend": "cpu",
+      "device": 0,
+      "threads": 4,
+      "lazy_load": true,
+      "idle_unload_ms": 90000,
+      "max_loaded_models": 1,
+      "ui": false,
+      "log_request_body": false,
+      "models": [
+        {
+          "id": "qwen3-asr",
+          "family": "qwen3_asr",
+          "path": "<PATH>/qwen3-asr-0.6b-q8_0.gguf",
+          "task": "asr",
+          "mode": "offline"
+        }
+      ]
+    }
+  }
+}
+```
+
+### Request-level settings
+
+
+#### Upstream text throughput / C053 and C057
+
+```json
+{
+  "name": "Upstream text throughput / C053 and C057",
+  "source": {
+    "path": "jarvis-flash174/upstream178_screen.py",
+    "bytes": 13617,
+    "sha256": "9041198db263ad5230e52e9c6d82eda65ebd1b7a6f6a3ebad1f8218f30767252"
+  },
+  "endpoint": "/completion",
+  "input": "Exact token array, complete native chat template; token digest recorded per observation",
+  "parameters": {
+    "n_predict": 512,
+    "stream": true,
+    "cache_prompt": false,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0,
+    "presence_penalty": 0,
+    "repeat_penalty": 1.0,
+    "seed": 174,
+    "ignore_eos": true
+  },
+  "thinking": "Native default ON; no forced thought budget",
+  "retrieval_changes": "Natural EOS; ignore_eos omitted; output budget min(4096, context - input - 32); exact values, JSON and closed reasoning checked"
+}
+```
+
+#### Historical thecodacus throughput / C043
+
+```json
+{
+  "name": "Historical thecodacus throughput / C043",
+  "source": {
+    "path": "jarvis-flash174/benchmark_http.py",
+    "bytes": 25314,
+    "sha256": "0c3a53256f1cc3490f6f21c6ddf2bfd9f40c092dba010adb704704d176844dd8"
+  },
+  "endpoint": "/completion",
+  "parameters": {
+    "n_predict": 512,
+    "stream": true,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0,
+    "presence_penalty": 0,
+    "repeat_penalty": 1.0,
+    "ignore_eos": true
+  },
+  "seed": "174 + repetition index",
+  "cache_prompt": "false for fresh requests; true for the separate reuse-requested series; actual cache_n verified",
+  "retrieval_changes": "Natural EOS, output budget min(16384, context - input - 32); cache_prompt false"
+}
+```
+
+#### Integrated public Responses / M0402
+
+```json
+{
+  "name": "Integrated public Responses / M0402",
+  "source": {
+    "path": "jarvis-fixes195/test_long_stream.py",
+    "bytes": 6907,
+    "sha256": "2eb9a3dfe9d4147941ee6d23ec4bec61e538bb25311bdc5a88ee8138df8cfe43"
+  },
+  "endpoint": "/v1/responses",
+  "parameters": {
+    "model": "jarvis-flash-next",
+    "stream": true,
+    "max_output_tokens": 2048,
+    "reasoning": {
+      "effort": "xhigh"
+    }
+  },
+  "input": "Repetitive synthetic history; actual 230100 tokens, no reused prefix, audio inactive",
+  "client_timeout_seconds": 1860,
+  "SSE_keepalive_seconds": 15,
+  "scope": "Single transport/completion check, not a semantic-quality or concurrent-voice benchmark"
+}
+```
+
+#### Twenty-phrase Polish voice transport
+
+```json
+{
+  "name": "Twenty-phrase Polish voice transport",
+  "source": {
+    "path": "jarvis-flash174/voice/voice-acceptance182.py",
+    "bytes": 11357,
+    "sha256": "38a418c22dbb4e1d3c03b221adca2bd41af30ce7b455e884a4258ace64b700e7"
+  },
+  "parameters": {
+    "phrases": 20,
+    "language": "pl",
+    "voice_kind": "clone",
+    "LLM_stream": true,
+    "LLM_max_tokens": 1024,
+    "voice_first_variant_enable_thinking": false,
+    "TTS_client_timeout_seconds": 130,
+    "ASR_client_timeout_seconds": 130,
+    "LLM_client_timeout_seconds": 600,
+    "resource_sample_interval_seconds": 0.5,
+    "VRAM_baseline_guard_MiB": 4656,
+    "VRAM_during_test_guard_MiB": 2048
+  },
+  "thinking_policy": "The later --voice-first variant explicitly disables thinking; the default path leaves native thinking enabled. This is not a claim that all earlier runs used the later first-response setting.",
+  "input": "Synthetic Polish phrases; no user microphone recording redistributed",
+  "timing": "TTS request to complete WAV receipt; not first audible audio. ASR uses the generated WAV.",
+  "percentiles": "p50 = sorted values[n//2] (upper middle for n=20); p95 = nearest-rank sorted values[ceil(0.95*n)-1]",
+  "concurrency": "Per-phrase llm_generating_at_tts_start is recorded; not every phrase overlaps active LLM decode",
+  "scope": "Transport and memory checks, not 20 live microphone turns or subjective voice quality"
+}
 ```

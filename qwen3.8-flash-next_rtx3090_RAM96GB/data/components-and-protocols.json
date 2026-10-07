@@ -1,0 +1,490 @@
+{
+  "scope": "Pinned deployment components and source-defined request protocols; not new inference. Audio JSON is the saved deployment configuration, not a request-time runtime dump.",
+  "components": [
+    {
+      "name": "llama-swap",
+      "version": "262",
+      "role": "Backend process management and API proxy",
+      "source": {
+        "path": "jarvis-flash174/llama-swap/jarvis-llama-swap.service",
+        "bytes": 1296,
+        "sha256": "09d723312009b7c849589ebfe1ffe10c0795148cd37a4bcd5d311df31a68c1f7"
+      },
+      "argv": [
+        "<PATH>/llama-swap",
+        "--config",
+        "<PATH>/config.yaml",
+        "--listen",
+        "127.0.0.1:14003"
+      ],
+      "launch_command": "'<PATH>/llama-swap' \\\n  --config '<PATH>/config.yaml' \\\n  --listen 127.0.0.1:14003",
+      "unset_environment": [
+        "GGML_CUDA_REGISTER_HOST",
+        "GGML_SCHED_PREFETCH_EXPERTS",
+        "GGML_CUDA_ENABLE_UNIFIED_MEMORY"
+      ]
+    },
+    {
+      "name": "Nginx",
+      "role": "Streaming HTTPS/API proxy; system package",
+      "argv": [
+        "/usr/sbin/nginx",
+        "-c",
+        "<PATH>/nginx.conf",
+        "-g",
+        "daemon off;"
+      ],
+      "launch_command": "/usr/sbin/nginx \\\n  -c '<PATH>/nginx.conf' \\\n  -g 'daemon off;'",
+      "service_source": {
+        "path": "jarvis-flash174/switching/systemd/jarvis-api-proxy.service",
+        "bytes": 854,
+        "sha256": "9d571ff2411b6086a947c5b1b49abff3494e243cde07ccb286f8297a0ae18a1c"
+      },
+      "source": {
+        "path": "jarvis-flash174/switching/nginx/api-inference.conf",
+        "bytes": 4570,
+        "sha256": "50f00248eeb720ba8019cb841985d8fa450b125f8ab9d04952dd5b1b17e8211b"
+      },
+      "proxy_settings": {
+        "proxy_read_timeout": [
+          "1860s"
+        ],
+        "proxy_send_timeout": [
+          "60s"
+        ],
+        "send_timeout": [
+          "60s"
+        ],
+        "proxy_buffering": [
+          "off"
+        ],
+        "proxy_request_buffering": [
+          "on"
+        ],
+        "proxy_http_version": [
+          "1.1"
+        ],
+        "proxy_next_upstream": [
+          "off"
+        ],
+        "client_body_timeout": [
+          "30s"
+        ],
+        "client_header_timeout": [
+          "15s"
+        ],
+        "client_max_body_size": [
+          "5m",
+          "25m",
+          "1m"
+        ]
+      },
+      "settings_scope": "Values from the saved switching configuration; body limits differ by route; not a full request-time configuration dump"
+    },
+    {
+      "name": "LiteLLM",
+      "version": "1.104.0",
+      "role": "OpenAI Chat Completions / Responses gateway",
+      "image": "ghcr.io/berriai/litellm@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839",
+      "source": {
+        "path": "jarvis-api168/compose.yaml",
+        "bytes": 1845,
+        "sha256": "340f464733051bd4e44b4f3ee7efb490df8511d8dbf638eceec65ad6dda4a396"
+      },
+      "container_arguments": [
+        "--config",
+        "/app/jarvis-config.yaml",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "14000"
+      ],
+      "launch_scope": "Image default entrypoint plus recorded container arguments; not a replacement executable",
+      "limits": {
+        "cpus": 2,
+        "memory_GiB": 3,
+        "pids": 512
+      },
+      "configuration_source": {
+        "path": "jarvis-api168/config.yaml",
+        "bytes": 2511,
+        "sha256": "4f787cd766fb83edd4510e9b47de6244f8083b4819ac292466c28b1bf38704b6"
+      },
+      "settings": {
+        "num_retries": 0,
+        "request_timeout_seconds": 1860,
+        "drop_params": true,
+        "turn_off_message_logging": true,
+        "router_num_retries": 0,
+        "router_timeout_seconds": 1860
+      },
+      "functional_test_settings": {
+        "use_chat_completions_api": true,
+        "sse_keepalive_ping_interval_seconds": 15
+      },
+      "functional_settings_source": {
+        "path": "jarvis-fixes195/install_keepalive.py",
+        "bytes": 4374,
+        "sha256": "e1937aee89dbfd0b1a2c680e0db6983757756d0641ad6a01887eee05a492c591"
+      }
+    },
+    {
+      "name": "Codex CLI",
+      "version": "0.160.1",
+      "role": "Long-history, native compaction and tool-continuation client"
+    },
+    {
+      "name": "Pithagoras",
+      "repository": "https://github.com/thecodacus/Pithagoras",
+      "commit": "a14763d7f6172d632ebe8577ee2cb581d8e1ae2e",
+      "image": "ghcr.io/thecodacus/pithagoras@sha256:9c899f8675392e9b74005e09d27d9b4071efa1a5fbb18c7bba61e2a196e4ef07",
+      "pi_sdk_lock_version": "0.82.1",
+      "source_patches": false,
+      "role": "Agent / tool / voice integration; EXECUTOR=host inside an unprivileged workspace container",
+      "argv": [
+        "/usr/bin/docker",
+        "compose",
+        "--env-file",
+        "portal.env",
+        "-f",
+        "compose.yml",
+        "up",
+        "-d",
+        "--pull",
+        "never"
+      ],
+      "launch_command": "/usr/bin/docker compose \\\n  --env-file portal.env \\\n  -f compose.yml \\\n  up \\\n  -d \\\n  --pull never",
+      "service_source": {
+        "path": "jarvis-flash174/jarvis-pithagoras.service",
+        "bytes": 680,
+        "sha256": "a6c35ac063f39c25b9b40416496784bf31096b4a0c997422b20f80df4d381b03"
+      },
+      "compose_source": {
+        "path": "jarvis-flash174/voice/portal-compose.yml",
+        "bytes": 3953,
+        "sha256": "061f6330c8065540880199d163723dcdf2eb02b046cc34d853a6be2892bfcb69"
+      },
+      "working_directory": "<PATH>/pithagoras",
+      "settings": {
+        "VOICE_PIPELINE_MODE": "parallel",
+        "VOICE_SKIP_FIRST_THINKING": true,
+        "VOICE_STATUS_SPEECH": false
+      }
+    },
+    {
+      "name": "pi-web-access",
+      "repository": "https://github.com/nicobailon/pi-web-access",
+      "version": "0.35.0",
+      "commit": "72c6e67787d67d8a7d01bf0abf30c072a6112de6",
+      "sha256": "42e48533218d038d483cbd59c323aa2d7f50300b47f7c65954e9b9bcb40ee09e",
+      "role": "Stock search and document retrieval tools"
+    },
+    {
+      "name": "Chromium",
+      "repository": "https://github.com/chromedp/docker-headless-shell",
+      "image": "docker.io/chromedp/headless-shell@sha256:a6beb6f169686744e05912a3ae25d97ee808510c9370142b00c3eb38c983db0e",
+      "version_observed": "155.0.8059.26",
+      "role": "Headless browser; CPU/software rendering",
+      "argv": [
+        "/headless-shell/headless-shell",
+        "--remote-debugging-address=0.0.0.0",
+        "--remote-debugging-port=9223",
+        "--disable-gpu",
+        "--enable-unsafe-swiftshader",
+        "--headless",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--user-data-dir=/profile",
+        "about:blank"
+      ],
+      "launch_command": "/headless-shell/headless-shell \\\n  --remote-debugging-address=0.0.0.0 \\\n  --remote-debugging-port=9223 \\\n  --disable-gpu \\\n  --enable-unsafe-swiftshader \\\n  --headless \\\n  --no-first-run \\\n  --no-default-browser-check \\\n  --user-data-dir=/profile about:blank",
+      "source": {
+        "path": "jarvis-flash174/voice/portal-compose.yml",
+        "bytes": 3953,
+        "sha256": "061f6330c8065540880199d163723dcdf2eb02b046cc34d853a6be2892bfcb69"
+      },
+      "limits": {
+        "cpus": 2,
+        "memory_GiB": 2,
+        "shm_GiB": 1,
+        "pids": 256
+      },
+      "CDP_transport": {
+        "argv": [
+          "socat",
+          "TCP4-LISTEN:9222,fork,reuseaddr",
+          "TCP4:127.0.0.1:9223"
+        ],
+        "cpus": 0.5,
+        "memory_MiB": 128
+      }
+    },
+    {
+      "name": "audio.cpp",
+      "repository": "https://github.com/0xShug0/audio.cpp",
+      "release": "v0.9.0",
+      "commit": "795c45fbde0a7d29c93b22199728ff5caaec02e5",
+      "cuda_architecture": "86",
+      "source_patches": false,
+      "build_commands": [
+        "bash scripts/build_linux.sh --native-model-manager --system-openssl --cuda on --cuda-arch 86 --build-dir \"$source_dir/build-cuda\" --build-type Release --model-set custom --models chatterbox --target audiocpp_server --jobs 4",
+        "bash scripts/build_linux.sh --cuda off --build-dir \"$source_dir/build-cpu\" --build-type Release --model-set custom --models qwen3_asr --target audiocpp_server --jobs 4"
+      ],
+      "models": {
+        "repository": "audio-cpp/audio.cpp-gguf",
+        "revision": "6d5436fc85f7a20c2e9f4e472b7f3a532f686444",
+        "chatterbox": {
+          "file": "Chatterbox-GGUF/chatterbox-q8_0.gguf",
+          "bytes": 2088393668,
+          "sha256": "d586dd1aa59613cab8046176fb7ca5ba191c02a9b10ffa5b0d892ed22b470656"
+        },
+        "qwen3_asr": {
+          "file": "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf",
+          "bytes": 1151272416,
+          "sha256": "6c44ec2fb4cee513892d7863c1fcc3ea6b699ffa4d899b0ef4ab19956d9544f7"
+        }
+      },
+      "tts": {
+        "source": {
+          "path": "jarvis-flash174/voice/jarvis-voice-tts.service",
+          "bytes": 713,
+          "sha256": "87090ca25a213dd16a2fd961c7cad6a68b1ff8fedfa54ceb782a70b271a930e7"
+        },
+        "argv": [
+          "<PATH>/audiocpp_server",
+          "--config",
+          "<PATH>/audio-tts.json",
+          "--no-ui"
+        ],
+        "launch_command": "'<PATH>/audiocpp_server' \\\n  --config '<PATH>/audio-tts.json' \\\n  --no-ui",
+        "environment": [
+          "CUDA_DEVICE_ORDER=PCI_BUS_ID",
+          "LD_LIBRARY_PATH=<PATH>/lib",
+          "CUDA_VISIBLE_DEVICES=0"
+        ],
+        "config_source": {
+          "path": "jarvis-flash174/voice/audio-tts.json",
+          "bytes": 607,
+          "sha256": "2705a142c2bf22fe4909f51f0db6df09f438c4cbc554f9949870c3fdcb363cef"
+        },
+        "configuration": {
+          "host": "127.0.0.1",
+          "port": 7862,
+          "backend": "cuda",
+          "device": 0,
+          "threads": 4,
+          "lazy_load": false,
+          "idle_unload_ms": 0,
+          "min_free_memory_mb": 2048,
+          "max_loaded_models": 1,
+          "ui": false,
+          "ui_management": true,
+          "log_request_body": false,
+          "models": [
+            {
+              "id": "chatterbox",
+              "family": "chatterbox",
+              "path": "<PATH>/chatterbox-q8_0.gguf",
+              "task": "clon",
+              "mode": "offline",
+              "session_options": {
+                "chatterbox.multilingual_t3": "v3",
+                "chatterbox.conditionals_cache_slots": "2"
+              }
+            }
+          ]
+        }
+      },
+      "asr": {
+        "source": {
+          "path": "jarvis-flash174/voice/jarvis-voice-asr.service",
+          "bytes": 624,
+          "sha256": "9f06274b1d4b83976c88594bcc0af376ae1c4bbbdd7d2e013b517f5d381373b9"
+        },
+        "argv": [
+          "<PATH>/audiocpp_server",
+          "--config",
+          "<PATH>/audio-asr.json",
+          "--no-ui"
+        ],
+        "launch_command": "'<PATH>/audiocpp_server' \\\n  --config '<PATH>/audio-asr.json' \\\n  --no-ui",
+        "environment": [
+          "CUDA_VISIBLE_DEVICES="
+        ],
+        "config_source": {
+          "path": "jarvis-flash174/voice/audio-asr.json",
+          "bytes": 428,
+          "sha256": "92f8250f4b5b623e734343d3d419eadebf411ed58523ef331d32e8311e1d7142"
+        },
+        "configuration": {
+          "host": "127.0.0.1",
+          "port": 7863,
+          "backend": "cpu",
+          "device": 0,
+          "threads": 4,
+          "lazy_load": true,
+          "idle_unload_ms": 90000,
+          "max_loaded_models": 1,
+          "ui": false,
+          "log_request_body": false,
+          "models": [
+            {
+              "id": "qwen3-asr",
+              "family": "qwen3_asr",
+              "path": "<PATH>/qwen3-asr-0.6b-q8_0.gguf",
+              "task": "asr",
+              "mode": "offline"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "request_protocols": [
+    {
+      "name": "Upstream text throughput / C053 and C057",
+      "source": {
+        "path": "jarvis-flash174/upstream178_screen.py",
+        "bytes": 13617,
+        "sha256": "9041198db263ad5230e52e9c6d82eda65ebd1b7a6f6a3ebad1f8218f30767252"
+      },
+      "endpoint": "/completion",
+      "input": "Exact token array, complete native chat template; token digest recorded per observation",
+      "parameters": {
+        "n_predict": 512,
+        "stream": true,
+        "cache_prompt": false,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "repeat_penalty": 1.0,
+        "seed": 174,
+        "ignore_eos": true
+      },
+      "thinking": "Native default ON; no forced thought budget",
+      "retrieval_changes": "Natural EOS; ignore_eos omitted; output budget min(4096, context - input - 32); exact values, JSON and closed reasoning checked"
+    },
+    {
+      "name": "Historical thecodacus throughput / C043",
+      "source": {
+        "path": "jarvis-flash174/benchmark_http.py",
+        "bytes": 25314,
+        "sha256": "0c3a53256f1cc3490f6f21c6ddf2bfd9f40c092dba010adb704704d176844dd8"
+      },
+      "endpoint": "/completion",
+      "parameters": {
+        "n_predict": 512,
+        "stream": true,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "repeat_penalty": 1.0,
+        "ignore_eos": true
+      },
+      "seed": "174 + repetition index",
+      "cache_prompt": "false for fresh requests; true for the separate reuse-requested series; actual cache_n verified",
+      "retrieval_changes": "Natural EOS, output budget min(16384, context - input - 32); cache_prompt false"
+    },
+    {
+      "name": "Integrated public Responses / M0402",
+      "source": {
+        "path": "jarvis-fixes195/test_long_stream.py",
+        "bytes": 6907,
+        "sha256": "2eb9a3dfe9d4147941ee6d23ec4bec61e538bb25311bdc5a88ee8138df8cfe43"
+      },
+      "endpoint": "/v1/responses",
+      "parameters": {
+        "model": "jarvis-flash-next",
+        "stream": true,
+        "max_output_tokens": 2048,
+        "reasoning": {
+          "effort": "xhigh"
+        }
+      },
+      "input": "Repetitive synthetic history; actual 230100 tokens, no reused prefix, audio inactive",
+      "client_timeout_seconds": 1860,
+      "SSE_keepalive_seconds": 15,
+      "scope": "Single transport/completion check, not a semantic-quality or concurrent-voice benchmark"
+    },
+    {
+      "name": "Twenty-phrase Polish voice transport",
+      "source": {
+        "path": "jarvis-flash174/voice/voice-acceptance182.py",
+        "bytes": 11357,
+        "sha256": "38a418c22dbb4e1d3c03b221adca2bd41af30ce7b455e884a4258ace64b700e7"
+      },
+      "parameters": {
+        "phrases": 20,
+        "language": "pl",
+        "voice_kind": "clone",
+        "LLM_stream": true,
+        "LLM_max_tokens": 1024,
+        "voice_first_variant_enable_thinking": false,
+        "TTS_client_timeout_seconds": 130,
+        "ASR_client_timeout_seconds": 130,
+        "LLM_client_timeout_seconds": 600,
+        "resource_sample_interval_seconds": 0.5,
+        "VRAM_baseline_guard_MiB": 4656,
+        "VRAM_during_test_guard_MiB": 2048
+      },
+      "thinking_policy": "The later --voice-first variant explicitly disables thinking; the default path leaves native thinking enabled. This is not a claim that all earlier runs used the later first-response setting.",
+      "input": "Synthetic Polish phrases; no user microphone recording redistributed",
+      "timing": "TTS request to complete WAV receipt; not first audible audio. ASR uses the generated WAV.",
+      "percentiles": "p50 = sorted values[n//2] (upper middle for n=20); p95 = nearest-rank sorted values[ceil(0.95*n)-1]",
+      "concurrency": "Per-phrase llm_generating_at_tts_start is recorded; not every phrase overlaps active LLM decode",
+      "scope": "Transport and memory checks, not 20 live microphone turns or subjective voice quality"
+    }
+  ],
+  "cache_conditions": {
+    "OS_file_cache": "Not routinely flushed; process restart does not establish cold NVMe",
+    "prefix_cache": "Reported separately from fresh tokens; throughput comparisons use fresh input",
+    "RAM_disk": "No RAM-disk A/B experiment; standard NVMe backing and OS page cache"
+  },
+  "build_invocations": [
+    {
+      "engine": "llama.cpp upstream",
+      "source": {
+        "path": "jarvis-flash174/upstream178-build.sh",
+        "bytes": 2186,
+        "sha256": "b46624daa26e715a97f149d9aaf39d700d2a794d342f242b157595a0ae1d2eba"
+      },
+      "build_command": "cmake --build \"$stage/build-cuda86\" --parallel 4 --target llama-server llama-bench"
+    },
+    {
+      "engine": "ik_llama.cpp",
+      "source": {
+        "path": "jarvis-flash174/ik178-build.sh",
+        "bytes": 2793,
+        "sha256": "28656824d4842236b9924952fd2efda768269114c93bd0b6e1940031d6fd6f4a"
+      },
+      "build_command": "cmake --build \"$stage/build-cuda86\" --parallel 4 --target llama-server llama-bench test-chat-template test-chat-auto-parser"
+    },
+    {
+      "engine": "OptLlama",
+      "source": {
+        "path": "jarvis-flash174/opt181-build.sh",
+        "bytes": 2109,
+        "sha256": "71dfb27ad7df6d0f2f08ec6ee6c70b6cad4faaddb273238edb0d6dfcf3378b9d"
+      },
+      "build_command": "cmake --build \"$stage/build-cuda86\" --parallel 4 \\\n    --target llama-server llama-bench test-chat-template test-chat-auto-parser"
+    },
+    {
+      "engine": "Strata",
+      "source": {
+        "path": "jarvis-flash174/strata188/build.sh",
+        "bytes": 727,
+        "sha256": "62760e503314258134a5f84b010f605d8bba723a8465964fc505d2f5061c175b"
+      },
+      "build_command": "cmake --build /output/build-cuda86 --target strata --parallel 4"
+    }
+  ],
+  "source_versions": {
+    "path": "jarvis-flash174/voice/versions.lock.json",
+    "bytes": 7284,
+    "sha256": "ef61da98b25027e84b1ff3330779bb8feb762a9bd7485bd77ac9a2a86a9c1e17"
+  }
+}
