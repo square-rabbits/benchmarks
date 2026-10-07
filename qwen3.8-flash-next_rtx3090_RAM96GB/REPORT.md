@@ -87,7 +87,7 @@ Do publikacji dołączono późniejsze pomiary Straty, próbę ograniczonego RAM
 
 Źródła projektu: [wagi Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF), [przypięta dokumentacja thecodacus](https://github.com/thecodacus/llama.cpp/blob/27c54b4bbcefadedcec6397477cc2e866c1db716/README.md), [Strata](https://github.com/Niko1221/Strata), [llama-swap](https://github.com/mostlygeek/llama-swap). Liczby w tabelach pochodzą z własnych zapisanych pomiarów, nie z deklaracji README lub komentarzy pod filmem.
 
-Q4 ma zapisany rozmiar 111323630080 bajtów. Wagi Q3 mają trzy shardy: 10946624, 49567921344 i 32382955968 bajtów. W manifestach są sumy poszczególnych shardów oraz projektora/MTP i buildów. Q3 to konkretny **UD-IQ3_XXS**, a nie dowolne „3 bity”. Nie zakładamy identycznej kwantyzacji wszystkich tensorów. Strata wykonywała natywny pack Q4, w którym 195 projekcji przechodziło do BF16; to dodatkowa różnica względem bezpośredniego ładowania GGUF w llama.cpp.
+Komplet czterech plików GGUF Q4 zajmuje **111334654784 bajty**. Natywna metryka `model_size` wynosiła 111323630080 bajtów — nie jest sumą rozmiarów shardów. Wagi Q3 mają trzy shardy: 10946624, 49567921344 i 32382955968 bajtów, łącznie **81961823936 bajtów**. W [osobnym manifeście](data/artifact-integrity.json) są sumy poszczególnych shardów oraz projektora, MTP i buildów. Q3 to konkretny **UD-IQ3_XXS**, a nie dowolne „3 bity”. Nie zakładamy identycznej kwantyzacji wszystkich tensorów. Strata wykonywała natywny pack Q4, w którym 195 projekcji przechodziło do BF16; to dodatkowa różnica względem bezpośredniego ładowania GGUF w llama.cpp.
 
 ## 5. Jak mierzono
 
