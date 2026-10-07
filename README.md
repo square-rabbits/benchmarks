@@ -1,18 +1,18 @@
 # Benchmarks
 
-Measured performance of local AI models, with configuration history, failures and limitations.
+Experimental studies of local AI inference: throughput, memory residency, context scaling and application latency.
 
 ## Qwen3.8-Flash-Next
 
-Hardware: **EVGA GeForce RTX 3090 OC FTW3 Ultra (not Ti), Ryzen 9 8945HX, nominal 96 GB RAM**.
+Hardware: **EVGA GeForce RTX 3090 OC FTW3 Ultra, Ryzen 9 8945HX, nominal 96 GB RAM**.
 
 - [Interactive report on GitHub Pages](https://square-rabbits.github.io/benchmarks/)
 - [Comprehensive Markdown report](qwen3.8-flash-next_rtx3090_RAM96GB/REPORT.md)
 - [Measurements CSV](qwen3.8-flash-next_rtx3090_RAM96GB/data/measurements.csv)
 - [Configurations and data JSON](qwen3.8-flash-next_rtx3090_RAM96GB/data/benchmark-data.json)
 
-The directory name reflects the owner's hardware correction: **RTX 3090, not RTX 3090 Ti**. Reports are in Polish, with an English abstract.
+The English report examines Unsloth Q3 and Q4 configurations across five inference implementations. It separates fresh-input throughput, natural retrieval, resource measurements and API/voice integration tests.
 
-The HTML is self-contained: download `index.html` to view its charts and filters offline. The Markdown and JSON files remain available in this repository.
+The HTML presents the research findings, interactive figures and a separate measurement explorer. Download `index.html` for offline use; no external runtime libraries are required.
 
-No private conversations, voice recordings, API credentials or server addresses are included. Source hashes identify original evidence; raw private artifacts are not published. Historical failures and missing configuration information are retained.
+Supplementary data include individual measurements, version-specific commands, recorded environments and artifact hashes. Complete raw input fixtures are not distributed; experimental scope and reproducibility constraints are described in the paper.
