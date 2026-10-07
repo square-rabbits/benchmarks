@@ -1,0 +1,30 @@
+{
+  "date": "2026-10-07",
+  "scope": "Offline report validation, not new inference or production acceptance",
+  "data_validation": {
+    "status": "PASS",
+    "unit_tests": 12,
+    "historical_measurement_rows_checked_against_originals": 395,
+    "source_files_size_and_sha256_verified": 2217,
+    "checks": [
+      "Historical rates, input size and context preserved without substitution",
+      "Missing configurations and failed attempts retained",
+      "GPU labelled RTX 3090, not Ti",
+      "Unique IDs and valid configuration references",
+      "Recorded weight and build hashes preserved",
+      "HTML embeds the same complete dataset as JSON",
+      "CSV contains all 406 rows",
+      "Privacy-marker scan; selected-field export excludes raw conversations and audio"
+    ]
+  },
+  "browser_validation": {
+    "status": "PASS",
+    "checks": 14,
+    "desktop_width_px": 1440,
+    "mobile_width_px": 390,
+    "runtime_errors": 0,
+    "external_runtime_requests": 0,
+    "features": ["Filters", "Charts", "Configuration details", "Sorting", "Pagination", "Filtered CSV download", "Responsive layout without horizontal page overflow"]
+  },
+  "limits": "Publication checks do not turn capped speed tests, failed quality tests or unaccepted microphone tests into PASS. Original private payloads are not redistributed."
+}
