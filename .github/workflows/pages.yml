@@ -18,6 +18,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
+      - name: Include root verification file in Pages artifact
+        run: cp myslop.txt qwen3.8-flash-next_rtx3090_RAM96GB/myslop.txt
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
